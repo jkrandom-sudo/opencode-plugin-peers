@@ -56,22 +56,41 @@ function toastDuration(message: string): number {
   return Math.min(12_000, 5_000 + extraLines * 1_500)
 }
 
-/** Toast feedback; silently degrades when no TUI is attached (headless). */
+/**
+ * Toast feedback; silently degrades when no TUI is attached (headless).
+ * Bounded by a timeout: with no TUI attached the /tui endpoint may never
+ * respond, and awaiting it would hang plugin init (and with it the whole
+ * opencode bootstrap).
+ */
+const TOAST_TIMEOUT_MS = 2_000
+
 export async function showToast(
   client: PluginInput["client"],
   message: string,
   logger: Logger
 ): Promise<void> {
   try {
-    await client.tui.showToast({
-      throwOnError: true,
-      body: {
-        title: TOAST_TITLE,
-        message,
-        variant: toastVariant(message),
-        duration: toastDuration(message),
-      },
-    })
+    if (!client.tui?.showToast) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        client.tui.showToast({
+          throwOnError: true,
+          body: {
+            title: TOAST_TITLE,
+            message,
+            variant: toastVariant(message),
+            duration: toastDuration(message),
+          },
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("toast timed out (no TUI attached)")), TOAST_TIMEOUT_MS)
+          timer.unref?.()
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   } catch (error) {
     await logger("debug", "toast unavailable", { error: errorMessage(error) })
   }

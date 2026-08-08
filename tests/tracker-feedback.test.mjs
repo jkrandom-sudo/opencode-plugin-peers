@@ -57,3 +57,33 @@ test("consumeCommand embeds result message when provided", () => {
   assert.match(parts[0].text, /verbatim/)
   assert.match(parts[0].text, /📋 result here/)
 })
+
+test("showToast resolves when the TUI endpoint never responds (headless hang guard)", async () => {
+  const { showToast } = await import("../dist/feedback.js")
+  const client = {
+    tui: {
+      showToast: () =>
+        new Promise((resolve) => {
+          const t = setTimeout(resolve, 60_000)
+          t.unref?.()
+        }), // effectively never settles, like no-TUI /tui
+    },
+  }
+  const logs = []
+  const logger = async (level, message, extra) => logs.push({ level, message, extra })
+  // Ref'd handle: the toast timeout timer is intentionally unref'd, so a
+  // bare test process needs other work to keep its event loop alive.
+  const keepAlive = setTimeout(() => {}, 5_000)
+  const start = Date.now()
+  await showToast(client, "📋 test", logger)
+  clearTimeout(keepAlive)
+  const elapsed = Date.now() - start
+  assert.ok(elapsed < 5_000, `showToast blocked for ${elapsed}ms`)
+  assert.equal(logs.at(-1)?.level, "debug")
+})
+
+test("showToast is a no-op when client.tui is missing", async () => {
+  const { showToast } = await import("../dist/feedback.js")
+  const logger = async () => {}
+  await showToast({}, "📋 test", logger)
+})

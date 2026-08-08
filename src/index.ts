@@ -120,7 +120,8 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   // Resolve name conflicts before announcing ourselves.
   const unique = uniqueName(currentName, await registry.list())
   if (unique.changed) {
-    await showToast(
+    // Fire-and-forget: plugin init must never block on UX feedback.
+    void showToast(
       ctx.client,
       `📋 Name "${currentName}" was taken; this instance is "${unique.name}".`,
       logger
