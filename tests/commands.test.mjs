@@ -108,6 +108,21 @@ test("/peers-inbox list/accept/drop flow", async () => {
   }
 })
 
+test("/list-agents is an alias of /peers", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
+  try {
+    const ctx = await makeCtx(dir)
+    const peers = await handlePeersCommand(ctx, "peers", "")
+    const alias = await handlePeersCommand(ctx, "list-agents", "")
+    assert.equal(alias.handled, true)
+    // identical listing body, both prefixed with the same emoji marker
+    assert.equal(alias.message, peers.message)
+    await ctx.registry.stop()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("unknown command passes through", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
   try {

@@ -10,7 +10,7 @@ Run several opencode terminals in parallel (different repos, worktrees, or tasks
 ## Features
 
 - `list_agents` / `send_message` tools — the agent can discover peers and text them
-- `/peers`, `/peers-name`, `/peers-inbox` commands — user-side control
+- `/peers` (alias `/list-agents`, compatible with Claude Code), `/peers-name`, `/peers-inbox` commands — user-side control
 - **accept / hold / refuse** inbound gating
 - Busy sessions queue messages; delivery happens when the session goes idle (plus a 15s fallback sweep)
 - Messages are **plain text only** — no files, no shared conversation history

@@ -34,8 +34,8 @@ import { handlePeersCommand } from "./commands.js"
 import { consumeCommand, createLogger, errorMessage, showToast } from "./feedback.js"
 import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 
-const PLUGIN_VERSION = "0.1.0"
-const COMMAND_NAMES = new Set(["peers", "peers-name", "peers-inbox"])
+const PLUGIN_VERSION = "0.1.1"
+const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox"])
 
 export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   const logger = createLogger(ctx.client)

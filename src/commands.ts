@@ -30,7 +30,8 @@ export async function handlePeersCommand(
   command: string,
   args: string
 ): Promise<CommandResult> {
-  if (command === "peers") {
+  // "list-agents" is an alias of "peers", matching Claude Code's /list-agents.
+  if (command === "peers" || command === "list-agents") {
     const peers = await ctx.registry.list()
     const listing = formatPeerList(peers, ctx.getName(), ctx.selfInstanceId)
     const held = ctx.queue.held()
