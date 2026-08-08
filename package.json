@@ -1,0 +1,81 @@
+{
+  "name": "opencode-plugin-peers",
+  "version": "0.1.0",
+  "description": "Cross-session messaging for opencode — let independent sessions discover and text each other, modeled after Claude Code's cross-session messaging",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./commands/peers.md": "./commands/peers.md",
+    "./commands/peers-name.md": "./commands/peers-name.md",
+    "./commands/peers-inbox.md": "./commands/peers-inbox.md",
+    "./commands/*": "./commands/*"
+  },
+  "files": [
+    "dist",
+    "commands",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "claude-code",
+    "cross-session",
+    "messaging",
+    "multi-agent",
+    "ai-coding-agent"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "opencode-plugin-peers authors"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jkrandom-sudo/opencode-plugin-peers.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jkrandom-sudo/opencode-plugin-peers/issues"
+  },
+  "homepage": "https://github.com/jkrandom-sudo/opencode-plugin-peers#readme",
+  "engines": {
+    "node": ">=18",
+    "opencode": ">=1.18.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "dry-run": "npm publish --dry-run",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.0"
+  },
+  "dependencies": {
+    "zod": "^4.1.8"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.4.0"
+  },
+  "opencode": {
+    "plugin": true,
+    "commands": [
+      "commands/peers.md",
+      "commands/peers-name.md",
+      "commands/peers-inbox.md"
+    ]
+  }
+}
