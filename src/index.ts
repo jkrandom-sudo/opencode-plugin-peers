@@ -37,9 +37,13 @@ import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 const PLUGIN_VERSION = "0.1.0"
 const COMMAND_NAMES = new Set(["peers", "peers-name", "peers-inbox"])
 
-export const PeersPlugin: Plugin = async (ctx) => {
+export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   const logger = createLogger(ctx.client)
-  const opts = (ctx as { options?: Partial<PluginConfig> }).options
+  // Options arrive either as the tuple's second element (pluginOptions) or,
+  // on some versions, attached to the context.
+  const opts =
+    (pluginOptions as Partial<PluginConfig> | undefined) ??
+    (ctx as { options?: Partial<PluginConfig> }).options
   const config = resolveConfig(opts)
 
   const instanceId = newInstanceId()
