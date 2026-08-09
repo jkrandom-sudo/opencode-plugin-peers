@@ -19,6 +19,9 @@ Cross-session messaging plugin for opencode: independent instances on the same m
 - Plugin options arrive as the **second `Plugin` argument** (tuple form in config), not on `ctx` — keep the dual read in `src/index.ts`.
 - Modules use factory functions, not `class` + `new` (opencode's loader can break `new`).
 - Commands (`/peers*`) are intercepted in `command.execute.before`; the result is written back into the first text part so it also works headless.
+- Single-Enter execution: `exports["./tui"]` → `src/tui.ts` registers the 4 commands as palette commands with `slashName` via `api.keymap.registerLayer`; selecting one dispatches `run()` → `client.session.command()` (same `command.execute.before` path as a normal submit). The TUI loads plugins from **`~/.config/opencode/tui.json`**, not `opencode.json` — both lists need the plugin.
+- `src/tui.ts` must compile to a **zero-runtime-import** `dist/tui.js` (`@opencode-ai/plugin/tui` re-exports `@opentui/keymap` at runtime, unresolvable inside the TUI process): `import type` only, no sibling-module imports — command names are deliberately duplicated from `COMMAND_NAMES`. Guarded by a tests/tui.test.mjs invariant.
+- Autocomplete ranking: the TUI fuzzy-ranks our slash row against the identical server-command row and breaks exact ties in reverse input order (server row wins → Enter inserts text). `slashAliases: [cmd]` adds a matching aliases key that lifts our row's combined score above the tie — do not remove it.
 
 ## Development workflow
 
@@ -33,3 +36,4 @@ Cross-session messaging plugin for opencode: independent instances on the same m
 - `session.idle` is not guaranteed on every opencode version — keep the fallback sweep.
 - `opencode serve` loads plugins lazily: create a session first before expecting registration.
 - When spawning background `opencode serve` processes from scripts, detach stdio (`nohup ... &` inside a subshell) or the parent hangs on the inherited pipe.
+- TUI E2E harness: drive the TUI with `( sleep N; printf '/cmd'; sleep 2; printf '\r'; sleep M ) | script -q /tmp/out opencode -c --print-logs`. macOS BSD `script` hangs after the input pipe EOFs until the child is killed — `pkill` the TUI from **outside** the pipeline (a pkill after the pipe in the same script never runs).
