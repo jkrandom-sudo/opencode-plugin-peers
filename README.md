@@ -129,7 +129,7 @@ opencode instance A                        opencode instance B
 
 - **Same-machine trust**: any process running as your user can read the registry files and therefore talk to your instances' inboxes. The bearer token protects against other users and accidental connections, not against a malicious process with your UID. This matches the trust level of Claude Code's local IPC.
 - **Prompt injection**: a peer message is untrusted input to the model, exactly like text pasted by a user. A compromised or buggy peer could try to talk your agent into doing something dangerous. With the default `peerPermissions: "allow"`, tool calls made while acting on a peer message are auto-approved — only run peers you trust on the machine, and set `peerPermissions: "ask"` (or `inboundPolicy: "hold"`/`"refuse"`) for sensitive projects.
-- **How auto-allow stays scoped**: the plugin's `permission.ask` hook only resolves requests whose originating user message is one it injected (detected via message metadata). Permission requests from your own typed turns fall through to opencode's normal rules untouched.
+- **How auto-allow stays scoped**: the plugin listens for permission-request events and only auto-replies when the requesting turn was started by a message it injected (detected by walking from the tool call's message up to the originating user message and checking its metadata). Permission requests from your own typed turns get no reply and fall through to opencode's normal prompt flow untouched.
 
 ## Limitations
 

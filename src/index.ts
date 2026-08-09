@@ -151,6 +151,13 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     }
   }
 
+  const permissions = PeerPermissions({
+    client: ctx.client,
+    mode: () => config.peerPermissions,
+    directory: ctx.directory,
+    logger,
+  })
+
   // Fallback sweep: session.idle is not guaranteed on every version/scenario,
   // so poll idle state periodically as a safety net.
   const sweeper = setInterval(() => {
@@ -172,6 +179,9 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
           break
         case "session.deleted":
           if (sid) tracker.noteDeleted(sid)
+          break
+        default:
+          await permissions.handleEvent(e)
           break
       }
     },
@@ -211,12 +221,6 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
         command: input.command,
       })
     },
-
-    "permission.ask": PeerPermissions({
-      client: ctx.client,
-      mode: () => config.peerPermissions,
-      logger,
-    }),
   }
 
   hooks.tool = buildPeerTools({
