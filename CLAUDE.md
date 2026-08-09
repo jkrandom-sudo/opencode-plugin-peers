@@ -35,4 +35,5 @@ Cross-session messaging plugin for opencode: independent instances on the same m
 - `session.idle` is not guaranteed on every opencode version — keep the fallback sweep.
 - `opencode serve` loads plugins lazily: create a session first before expecting registration.
 - When spawning background `opencode serve` processes from scripts, detach stdio (`nohup ... &` inside a subshell) or the parent hangs on the inherited pipe.
+- Local upgrades: a bare plugin spec resolves via `Npm.add("<name>@latest")` to `~/.cache/opencode/packages/<name>@latest/`, and `opencode plugin -g <name>` does NOT refresh it — after publishing a new version, update that dir's pin + `npm install` (and `<name>/` if present too), or the runtime keeps loading the stale copy.
 - TUI E2E harness: drive the TUI with `( sleep N; printf '/cmd'; sleep 2; printf '\r'; sleep M ) | script -q /tmp/out opencode -c --print-logs`. macOS BSD `script` hangs after the input pipe EOFs until the child is killed — `pkill` the TUI from **outside** the pipeline (a pkill after the pipe in the same script never runs).
