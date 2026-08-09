@@ -116,6 +116,8 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
         switch (result.status) {
           case "delivered":
             return `Message delivered to "${peer.name}".`
+          case "duplicate":
+            return `Message was already received by "${peer.name}".`
           case "queued":
             return `Message queued for "${peer.name}" (their session is busy; it will be delivered when idle).`
           case "held":

@@ -52,8 +52,10 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   const inboxToken = newInboxToken()
   const tracker = SessionTracker()
   const queue = MessageQueue({
+    endpointId: instanceId,
     maxQueue: config.maxQueue,
     maxHeld: config.maxHeld,
+    heldExpiryMs: config.heldExpiryMs,
     inboxFile: config.inboxFile,
     logger,
   })
@@ -76,11 +78,19 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   const listener = InboxListener({
     token: inboxToken,
     maxBodyBytes: config.maxMessageBytes * 2 + 4096,
+    maxMessageBytes: config.maxMessageBytes,
+    maxMessageAgeMs: config.maxMessageAgeMs,
     logger,
     onMessage: async (msg): Promise<ReceiveStatus> => {
+      const existing = queue.existingStatus(msg)
+      if (existing) return existing
+      if (queue.isDebounced(msg)) return "duplicate"
       if (!recvLimit(msg.from.instanceId)) return "full"
       const decision = gateMessage(policy, msg)
-      if (decision === "refuse") return "refused"
+      if (decision === "refuse") {
+        await queue.refuse(msg)
+        return "refused"
+      }
       if (decision === "hold") {
         const ok = await queue.hold(msg)
         if (!ok) return "full"

@@ -121,6 +121,7 @@ test("send_message maps all receiver statuses", async () => {
     ["queued", /queued for "beta".*busy/],
     ["held", /awaits their approval/],
     ["delivered", /delivered to "beta"/],
+    ["duplicate", /already received/],
   ]
   for (const [status, re] of cases) {
     const { tools } = makeTools({ listed, sendResult: { ok: true, status } })

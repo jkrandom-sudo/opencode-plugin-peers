@@ -6,11 +6,16 @@
 
 import { createServer, type Server } from "node:http"
 import type { AddressInfo } from "node:net"
+import { z } from "zod"
 import type { InboundMessage, Logger, ReceiveStatus } from "./types.js"
 
 export interface ListenerOptions {
   token: string
   maxBodyBytes: number
+  /** Receiver-side text limit, measured as UTF-8 bytes. */
+  maxMessageBytes?: number
+  /** Maximum permitted clock age/skew for a sender timestamp. */
+  maxMessageAgeMs?: number
   onMessage: (msg: InboundMessage) => Promise<ReceiveStatus>
   logger: Logger
 }
@@ -21,6 +26,22 @@ export interface ListenerInstance {
 }
 
 const MAX_HOPS = 4
+
+const inboundMessageSchema = z
+  .object({
+    id: z.string().min(1),
+    from: z
+      .object({
+        instanceId: z.string().min(1),
+        name: z.string().min(1),
+        directory: z.string().min(1),
+      })
+      .strict(),
+    text: z.string(),
+    via: z.array(z.string()).max(MAX_HOPS),
+    sentAt: z.number().finite(),
+  })
+  .strict()
 
 function statusToHttp(status: ReceiveStatus): number {
   switch (status) {
@@ -34,33 +55,8 @@ function statusToHttp(status: ReceiveStatus): number {
 }
 
 function parseMessage(body: unknown): InboundMessage | null {
-  if (typeof body !== "object" || body === null) return null
-  const b = body as Record<string, unknown>
-  const from = b.from as Record<string, unknown> | undefined
-  if (
-    typeof b.id !== "string" ||
-    typeof b.text !== "string" ||
-    !Array.isArray(b.via) ||
-    typeof b.sentAt !== "number" ||
-    !from ||
-    typeof from.instanceId !== "string" ||
-    typeof from.name !== "string" ||
-    typeof from.directory !== "string"
-  ) {
-    return null
-  }
-  if (b.via.length > MAX_HOPS) return null
-  return {
-    id: b.id,
-    from: {
-      instanceId: from.instanceId,
-      name: from.name,
-      directory: from.directory,
-    },
-    text: b.text,
-    via: b.via.filter((v): v is string => typeof v === "string"),
-    sentAt: b.sentAt,
-  }
+  const parsed = inboundMessageSchema.safeParse(body)
+  return parsed.success ? parsed.data : null
 }
 
 export function InboxListener(opts: ListenerOptions): ListenerInstance {
@@ -117,6 +113,14 @@ export function InboxListener(opts: ListenerOptions): ListenerInstance {
     const msg = parseMessage(parsed)
     if (!msg) {
       send(400, { error: "invalid message shape" })
+      return
+    }
+    if (Buffer.byteLength(msg.text, "utf8") > (opts.maxMessageBytes ?? 8192)) {
+      send(413, { error: "message too large" })
+      return
+    }
+    if (Math.abs(Date.now() - msg.sentAt) > (opts.maxMessageAgeMs ?? 300_000)) {
+      send(400, { error: "stale message" })
       return
     }
 

@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Delivery, formatMessages } from "../dist/delivery.js"
@@ -60,6 +60,24 @@ test("flush delivers only when idle with an active session", async () => {
     assert.match(text, /hello 1/)
     assert.match(text, /peerPermissions/)
     assert.match(text, /send_message/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("flush marks injected messages delivered in the durable spool", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-delivery-"))
+  try {
+    const calls = []
+    const queue = await makeQueue(dir)
+    queue.enqueue(msg("durable-delivery"))
+    const tracker = SessionTracker()
+    tracker.noteIdle("ses_1")
+    const delivery = Delivery({ client: makeClient(calls), tracker, queue, directory: "/tmp/a", logger: noopLogger })
+
+    assert.equal(await delivery.flush(), true)
+    assert.equal((await readdir(join(dir, "spool", "legacy", "done"))).length, 1)
+    assert.equal((await readdir(join(dir, "spool", "legacy", "inflight"))).length, 0)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -129,6 +147,8 @@ test("failed injection requeues messages in order", async () => {
     const d = Delivery({ client: makeClient(calls, { fail: true }), tracker, queue, directory: "/tmp/a", logger: noopLogger })
     assert.equal(await d.flush(), false)
     assert.deepEqual(queue.pending().map((m) => m.id), ["1", "2"])
+    assert.equal((await readdir(join(dir, "spool", "legacy", "inflight"))).length, 0)
+    assert.equal((await readdir(join(dir, "spool", "legacy", "queued"))).length, 2)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

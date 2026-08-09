@@ -89,6 +89,7 @@ export function Delivery(opts: DeliveryOptions): DeliveryInstance {
         const messages = opts.queue.drain()
         try {
           await inject(sessionId, formatMessages(messages))
+          await opts.queue.complete(messages)
           await opts.logger("info", "delivered peer messages", {
             count: messages.length,
             sessionId,
@@ -96,7 +97,7 @@ export function Delivery(opts: DeliveryOptions): DeliveryInstance {
           return true
         } catch (err) {
           // Put messages back (order preserved) so a later flush can retry.
-          for (const m of messages) opts.queue.enqueue(m)
+          await opts.queue.requeue(messages)
           await opts.logger("error", "failed to deliver peer messages", {
             error: String(err),
             sessionId,

@@ -109,6 +109,48 @@ test("listener rejects malformed message and via-loop", async () => {
   }
 })
 
+test("listener enforces the configured UTF-8 message byte limit", async () => {
+  const { listener, url } = await startListener(async () => "queued", { maxMessageBytes: 4 })
+  try {
+    const res = await fetch(`${url}/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer secret" },
+      body: JSON.stringify({ ...buildMessage(self, "💣💣") }),
+    })
+    assert.equal(res.status, 413)
+  } finally {
+    await listener.stop()
+  }
+})
+
+test("listener rejects messages whose sender timestamp is stale", async () => {
+  const { listener, url } = await startListener(async () => "queued", { maxMessageAgeMs: 10 })
+  try {
+    const res = await fetch(`${url}/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer secret" },
+      body: JSON.stringify({ ...buildMessage(self, "late"), sentAt: Date.now() - 11 }),
+    })
+    assert.equal(res.status, 400)
+  } finally {
+    await listener.stop()
+  }
+})
+
+test("listener rejects a message whose hop list contains a non-string", async () => {
+  const { listener, url } = await startListener(async () => "queued")
+  try {
+    const res = await fetch(`${url}/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer secret" },
+      body: JSON.stringify({ ...buildMessage(self, "bad schema"), via: ["alpha", 1] }),
+    })
+    assert.equal(res.status, 400)
+  } finally {
+    await listener.stop()
+  }
+})
+
 test("sender maps refused and full statuses", async () => {
   const { listener: l1, url: u1 } = await startListener(async () => "refused")
   const { listener: l2, url: u2 } = await startListener(async () => "full")
