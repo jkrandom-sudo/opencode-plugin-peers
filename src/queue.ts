@@ -5,16 +5,15 @@
 import {
   chmodSync,
   closeSync,
+  existsSync,
   fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
   renameSync,
-  rmSync,
   statSync,
   unlinkSync,
-  writeFileSync,
   writeSync,
 } from "node:fs"
 import { createHash, randomBytes } from "node:crypto"
@@ -25,6 +24,7 @@ import type { HeldMessage, InboundMessage, Logger, PeerAcknowledgementV2, Receiv
 const COMPLETED_DEDUPE_RETENTION_MS = 86_400_000
 const LOCK_STALE_MS = 30_000
 const LOCK_WAIT_MS = 5_000
+const LOCK_POLL_MS = 10
 
 type SpoolState = "queued" | "held" | "inflight" | "done"
 
@@ -109,7 +109,7 @@ export function MessageQueue(opts: QueueOptions): QueueInstance {
   const heldExpiryMs = opts.heldExpiryMs ?? 300_000
   const debounceMs = opts.debounceMs ?? 1_000
   const recentContent = new Map<string, number>()
-  const lockDir = join(spoolDir, ".lock")
+  const lockTicketsDir = join(spoolDir, ".lock-tickets")
   const sequenceFile = join(spoolDir, "sequence")
 
   function ensureEndpointDirectories(): void {
@@ -120,52 +120,112 @@ export function MessageQueue(opts: QueueOptions): QueueInstance {
       mkdirSync(directory, { recursive: true, mode: 0o700 })
       chmodSync(directory, 0o700)
     }
+    mkdirSync(lockTicketsDir, { recursive: true, mode: 0o700 })
+    chmodSync(lockTicketsDir, 0o700)
   }
 
-  function recoverStaleLock(): boolean {
+  function removeClaim(path: string): void {
     try {
-      const age = Date.now() - statSync(lockDir).mtimeMs
-      if (age <= LOCK_STALE_MS) return false
-      const stale = `${lockDir}.stale-${process.pid}-${Date.now()}`
-      renameSync(lockDir, stale)
-      rmSync(stale, { recursive: true, force: true })
-      return true
-    } catch {
-      return false
+      unlinkSync(path)
+      syncDirectory(lockTicketsDir)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err
+    }
+  }
+
+  function createClaim(path: string, record: unknown): void {
+    const fd = openSync(path, "wx", 0o600)
+    try {
+      writeSync(fd, JSON.stringify(record))
+      fsyncSync(fd)
+    } catch (err) {
+      try {
+        closeSync(fd)
+      } finally {
+        removeClaim(path)
+      }
+      throw err
+    }
+    try {
+      closeSync(fd)
+      syncDirectory(lockTicketsDir)
+    } catch (err) {
+      removeClaim(path)
+      throw err
+    }
+  }
+
+  function claimFiles(): string[] {
+    return readdirSync(lockTicketsDir).filter(
+      (file) => /^choosing-[a-f0-9]{32}\.json$/.test(file) || /^ticket-\d{16}-[a-f0-9]{32}\.json$/.test(file)
+    )
+  }
+
+  function recoverStaleClaims(): void {
+    for (const file of claimFiles()) {
+      const path = join(lockTicketsDir, file)
+      try {
+        if (Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS) removeClaim(path)
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err
+      }
+    }
+  }
+
+  function ticketNumber(file: string): number | null {
+    const match = /^ticket-(\d{16})-[a-f0-9]{32}\.json$/.exec(file)
+    return match ? Number(match[1]) : null
+  }
+
+  // Filesystem bakery lock: every doorway/queue entry has a unique path that
+  // is never reused, so stale cleanup and release can only unlink the exact
+  // claim they observed or created. Choosing entries prevent a late contender
+  // from publishing a lower ticket after another contender has entered.
+  function acquireLockTicket(deadline: number): string {
+    const token = randomBytes(16).toString("hex")
+    const choosingPath = join(lockTicketsDir, `choosing-${token}.json`)
+    let ticketPath: string | null = null
+    createClaim(choosingPath, { kind: "choosing", token, pid: process.pid, createdAt: Date.now() })
+    try {
+      recoverStaleClaims()
+      const highest = claimFiles().reduce((max, file) => Math.max(max, ticketNumber(file) ?? 0), 0)
+      if (Date.now() >= deadline) throw new Error(`timed out acquiring message spool lock: ${lockTicketsDir}`)
+      const ticket = highest + 1
+      ticketPath = join(lockTicketsDir, `ticket-${String(ticket).padStart(16, "0")}-${token}.json`)
+      createClaim(ticketPath, { kind: "ticket", ticket, token, pid: process.pid, createdAt: Date.now() })
+    } finally {
+      removeClaim(choosingPath)
+    }
+
+    for (;;) {
+      recoverStaleClaims()
+      if (!existsSync(ticketPath)) {
+        throw new Error(`message spool lock claim expired before admission: ${ticketPath}`)
+      }
+      if (Date.now() >= deadline) {
+        removeClaim(ticketPath)
+        throw new Error(`timed out acquiring message spool lock: ${lockTicketsDir}`)
+      }
+      const claims = claimFiles()
+      const choosing = claims.some((file) => file.startsWith("choosing-"))
+      const tickets = claims
+        .flatMap((file) => {
+          const ticket = ticketNumber(file)
+          return ticket === null ? [] : [{ file, ticket }]
+        })
+        .sort((a, b) => a.ticket - b.ticket || (a.file < b.file ? -1 : a.file > b.file ? 1 : 0))
+      if (!choosing && tickets[0]?.file === ticketPath.slice(lockTicketsDir.length + 1)) return ticketPath
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_POLL_MS)
     }
   }
 
   function withEndpointLock<T>(operation: () => T): T {
     ensureEndpointDirectories()
-    const deadline = Date.now() + LOCK_WAIT_MS
-    const token = randomBytes(16).toString("hex")
-    for (;;) {
-      try {
-        mkdirSync(lockDir, { mode: 0o700 })
-        chmodSync(lockDir, 0o700)
-        try {
-          writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), { mode: 0o600 })
-        } catch (err) {
-          rmSync(lockDir, { recursive: true, force: true })
-          throw err
-        }
-        break
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err
-        if (recoverStaleLock()) continue
-        if (Date.now() >= deadline) throw new Error(`timed out acquiring message spool lock: ${lockDir}`)
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
-      }
-    }
+    const ticketPath = acquireLockTicket(Date.now() + LOCK_WAIT_MS)
     try {
       return operation()
     } finally {
-      try {
-        const owner = JSON.parse(readFileSync(join(lockDir, "owner.json"), "utf8")) as { token?: string }
-        if (owner.token === token) rmSync(lockDir, { recursive: true, force: true })
-      } catch {
-        // A stale-lock takeover may have replaced this owner's lock directory.
-      }
+      removeClaim(ticketPath)
     }
   }
 

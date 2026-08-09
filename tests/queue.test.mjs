@@ -119,17 +119,19 @@ test("queue: malformed neighbors do not consume valid queue capacity", async () 
   }
 })
 
-test("queue: recovers an aged filesystem lock even when its pid was reused", async () => {
+test("queue: recovers an aged immutable ticket even when its pid was reused", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peers-queue-"))
   try {
-    const lockDir = join(dir, "spool", "endpoint-a", ".lock")
-    await mkdir(lockDir, { recursive: true })
-    await writeFile(join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, createdAt: Date.now() - 31_000 }))
+    const ticketsDir = join(dir, "spool", "endpoint-a", ".lock-tickets")
+    await mkdir(ticketsDir, { recursive: true })
+    const staleTicket = join(ticketsDir, "ticket-0000000000000001-00000000000000000000000000000000.json")
+    await writeFile(staleTicket, JSON.stringify({ ticket: 1, token: "stale", pid: process.pid, createdAt: Date.now() - 31_000 }))
     const old = new Date(Date.now() - 31_000)
-    await utimes(lockDir, old, old)
+    await utimes(staleTicket, old, old)
 
     const q = MessageQueue({ endpointId: "endpoint-a", maxQueue: 1, maxHeld: 1, inboxFile: join(dir, "inbox.json"), logger: noopLogger })
     assert.equal(q.enqueue(msg("after-stale-lock")), true)
+    assert.deepEqual(await readdir(ticketsDir), [])
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
