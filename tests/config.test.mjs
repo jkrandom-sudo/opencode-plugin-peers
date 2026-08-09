@@ -13,6 +13,7 @@ test("resolveConfig applies defaults", () => {
   assert.equal(cfg.peersDir, "/xdg/opencode-plugin-peers/peers.d")
   assert.equal(cfg.inboxFile, "/xdg/opencode-plugin-peers/inbox.json")
   assert.equal(cfg.inboundPolicy, "accept")
+  assert.equal(cfg.peerPermissions, "allow")
   assert.equal(cfg.heartbeatMs, 10_000)
   assert.equal(cfg.staleMs, 30_000)
   assert.equal(cfg.maxQueue, 50)
@@ -25,10 +26,11 @@ test("resolveConfig applies defaults", () => {
 
 test("resolveConfig merges user options", () => {
   const cfg = resolveConfig(
-    { inboundPolicy: "hold", name: "frontend", maxQueue: 5, storageDir: "/custom" },
+    { inboundPolicy: "hold", name: "frontend", maxQueue: 5, storageDir: "/custom", peerPermissions: "ask" },
     {}
   )
   assert.equal(cfg.inboundPolicy, "hold")
+  assert.equal(cfg.peerPermissions, "ask")
   assert.equal(cfg.name, "frontend")
   assert.equal(cfg.maxQueue, 5)
   assert.equal(cfg.peersDir, "/custom/peers.d")

@@ -1,13 +1,13 @@
 /**
  * /peers, /peers-name, /peers-inbox command handling.
  * Commands are intercepted in command.execute.before: the plugin does the
- * work synchronously, shows a toast, and replaces the prompt parts so the
- * agent only acknowledges.
+ * work synchronously and replaces the prompt parts with the result, which
+ * is displayed inline in the session.
  */
 
 import { validateName } from "./config.js"
-import { formatPeerList } from "./tools/peers-tools.js"
-import type { ListedPeer, RegistryInstance } from "./registry.js"
+import { formatSessionList } from "./format.js"
+import type { RegistryInstance } from "./registry.js"
 import type { QueueInstance } from "./queue.js"
 import type { DeliveryInstance } from "./delivery.js"
 
@@ -33,7 +33,7 @@ export async function handlePeersCommand(
   // "list-agents" is an alias of "peers", matching Claude Code's /list-agents.
   if (command === "peers" || command === "list-agents") {
     const peers = await ctx.registry.list()
-    const listing = formatPeerList(peers, ctx.getName(), ctx.selfInstanceId)
+    const listing = formatSessionList(peers, Date.now())
     const held = ctx.queue.held()
     const pending = ctx.queue.size()
     const suffix =

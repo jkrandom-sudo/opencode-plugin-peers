@@ -11,7 +11,7 @@ const noopLogger = async () => {}
 
 async function makeCtx(dir) {
   const peersDir = join(dir, "peers.d")
-  const dyn = { name: "alpha", inboundPolicy: "accept", activeSessionId: null, activeSessionTitle: null }
+  const dyn = { name: "alpha", inboundPolicy: "accept", activeSessionId: null, activeSessionTitle: null, busy: false, queuedCount: 0 }
   const registry = Registry({
     peersDir,
     instanceId: newInstanceId(),
@@ -50,14 +50,13 @@ const msg = (id) => ({
   sentAt: Date.now(),
 })
 
-test("/peers lists online status and self", async () => {
+test("/peers shows an empty Claude-Code-style session list", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
   try {
     const ctx = await makeCtx(dir)
     const res = await handlePeersCommand(ctx, "peers", "")
     assert.equal(res.handled, true)
-    assert.match(res.message, /No peers online/)
-    assert.match(res.message, /You are "alpha"/)
+    assert.match(res.message, /No other opencode sessions online/)
     await ctx.registry.stop()
   } finally {
     await rm(dir, { recursive: true, force: true })

@@ -58,8 +58,39 @@ test("flush delivers only when idle with an active session", async () => {
     const text = calls[0].body.parts[0].text
     assert.match(text, /\[peer message from "beta" @ \/tmp\/b\]/)
     assert.match(text, /hello 1/)
-    assert.match(text, /no privileges/)
+    assert.match(text, /peerPermissions/)
     assert.match(text, /send_message/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("notice injects a display-only message only when idle", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-delivery-"))
+  try {
+    const calls = []
+    const tracker = SessionTracker()
+    const queue = await makeQueue(dir)
+    const d = Delivery({ client: makeClient(calls), tracker, queue, directory: "/tmp/a", logger: noopLogger })
+
+    // no active session: skipped
+    await d.notice("held message")
+    assert.equal(calls.length, 0)
+
+    // busy: skipped
+    tracker.noteUserActivity("ses_1")
+    await d.notice("held message")
+    assert.equal(calls.length, 0)
+
+    // idle: injected with the display-only footer
+    tracker.noteIdle("ses_1")
+    await d.notice("held message")
+    assert.equal(calls.length, 1)
+    const text = calls[0].body.parts[0].text
+    assert.match(text, /\[notification from opencode-plugin-peers\]/)
+    assert.match(text, /held message/)
+    assert.match(text, /Show it to the user verbatim, then stop/)
+    assert.equal(calls[0].body.parts[0].synthetic, true)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

@@ -14,6 +14,10 @@ export interface RegistryDynamic {
   inboundPolicy: InboundPolicy
   activeSessionId: string | null
   activeSessionTitle: string | null
+  /** True while a turn is running in the active session. */
+  busy: boolean
+  /** Messages queued locally awaiting delivery. */
+  queuedCount: number
 }
 
 export interface RegistryOptions {
@@ -85,6 +89,8 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
       inboxToken: opts.inboxToken,
       activeSessionId: dyn.activeSessionId,
       activeSessionTitle: dyn.activeSessionTitle,
+      busy: dyn.busy,
+      queuedCount: dyn.queuedCount,
       inboundPolicy: dyn.inboundPolicy,
       startedAt,
       heartbeatAt: Date.now(),

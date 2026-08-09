@@ -1,6 +1,6 @@
 import { homedir } from "node:os"
 import { join } from "node:path"
-import type { PluginConfig } from "./types.js"
+import type { PeerPermissionMode, PluginConfig } from "./types.js"
 
 export interface ResolvedConfig {
   storageDir: string
@@ -8,6 +8,7 @@ export interface ResolvedConfig {
   inboxFile: string
   name: string | undefined
   inboundPolicy: "accept" | "hold" | "refuse"
+  peerPermissions: PeerPermissionMode
   heartbeatMs: number
   staleMs: number
   maxQueue: number
@@ -36,6 +37,7 @@ export function resolveConfig(
     inboxFile: join(storageDir, "inbox.json"),
     name: opts?.name,
     inboundPolicy: opts?.inboundPolicy ?? "accept",
+    peerPermissions: opts?.peerPermissions ?? "allow",
     heartbeatMs: opts?.heartbeatMs ?? 10_000,
     staleMs: opts?.staleMs ?? 30_000,
     maxQueue: opts?.maxQueue ?? 50,
