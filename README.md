@@ -80,7 +80,7 @@ Other Opencode sessions (2):
   [idle]  ·  backend  ·  /Users/you/app/backend  ·  started 29m ago
 ```
 
-`[waiting]` = a turn is running there (your message queues until it finishes), `[idle]` = ready to receive.
+`[waiting]` = a turn is running there, but peer messages are still injected immediately; `[idle]` = no turn is running. A queued message means an immediate injection attempt needs retry, not that delivery waits for idle, and the sender keeps a pending final ACK meanwhile.
 
 **Let the agent talk:**
 
@@ -125,7 +125,7 @@ Options can be passed via the tuple form in `opencode.json`:
 | `maxMessageBytes` | `8192` | per-message size cap |
 | `sendRatePerMin` | `10` | outbound rate limit per peer |
 | `recvRatePerMin` | `20` | inbound rate limit per sender |
-| `sweepMs` | `15000` | fallback idle-check interval |
+| `sweepMs` | `15000` | fallback delivery/ACK reliability sweep interval |
 
 ## How it works
 
@@ -186,7 +186,8 @@ cd /tmp/proj-b && opencode
 # in beta's session:
 Use send_message to tell "alpha": the deploy keys rotated, pull again.
 
-# alpha receives the text once its session is idle.
+# alpha receives the text immediately, including while its session is busy;
+# transport receipt remains distinct from the final delivery ACK.
 ```
 
 Headless variant used in development:
@@ -196,6 +197,8 @@ cd /tmp/proj-a && opencode serve --port 14100 &
 cd /tmp/proj-b && opencode serve --port 14101 &
 # then drive both via the HTTP API (POST /session, /session/:id/prompt_async)
 ```
+
+The credential-free real-host test starts actual OpenCode processes and drives the loaded plugin's event and command hooks. It verifies busy registry state before real `promptAsync` injection, resolves permission provenance through the real stored peer message, checks default `allow` versus `ask`, and checks protected requests are left to native policy. It cannot create a genuine model-provider permission request without provider credentials, so the fixture captures the plugin's reply call instead of claiming an end-to-end native permission prompt; focused tests cover the remaining native-deny and protected-category decisions.
 
 ## Development
 

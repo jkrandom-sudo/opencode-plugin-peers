@@ -14,7 +14,7 @@ import { Sender } from "../dist/sender.js"
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pluginUrl = pathToFileURL(join(here, "..", "dist", "index.js")).href
-const holdPluginUrl = pathToFileURL(join(here, "fixtures", "real-opencode-hold-plugin.mjs")).href
+const hostPluginUrl = pathToFileURL(join(here, "fixtures", "real-opencode-host-plugin.mjs")).href
 
 async function freePort() {
   const server = createServer()
@@ -40,7 +40,7 @@ async function waitFor(fn, timeoutMs = 15_000) {
   throw last ?? new Error(`condition not met within ${timeoutMs}ms`)
 }
 
-async function startOpenCode(binary, root, label, directory, dataDir, runtimeDir, plugin, port) {
+async function startOpenCode(binary, root, label, directory, dataDir, runtimeDir, plugin, port, extraEnv = {}) {
   const configDir = join(root, `config-${label}`)
   const xdgConfig = join(root, `xdg-${label}`)
   await Promise.all([mkdir(configDir, { recursive: true }), mkdir(xdgConfig, { recursive: true }), mkdir(directory, { recursive: true })])
@@ -56,6 +56,7 @@ async function startOpenCode(binary, root, label, directory, dataDir, runtimeDir
       OPENCODE_DISABLE_DEFAULT_PLUGINS: "1",
       OPENCODE_DISABLE_PROJECT_CONFIG: "1",
       OPENCODE_DISABLE_CLAUDE_CODE: "1",
+      ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
   })
@@ -72,6 +73,25 @@ async function startOpenCode(binary, root, label, directory, dataDir, runtimeDir
     }
   })
   return { child, port, directory, logs: () => logs }
+}
+
+async function fixtureControl(file) {
+  return waitFor(async () => JSON.parse(await readFile(file, "utf8")))
+}
+
+async function callFixture(control, action, body) {
+  const response = await fetch(`http://127.0.0.1:${control.port}/${action}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-peers-fixture-token": control.token },
+    body: JSON.stringify(body),
+  })
+  const result = await response.json()
+  assert.equal(response.ok, true, JSON.stringify(result))
+  return result
+}
+
+function messageIdContaining(messages, text) {
+  return messages.find((message) => JSON.stringify(message).includes(text))?.info?.id
 }
 
 async function stopOpenCode(proc) {
@@ -123,7 +143,7 @@ function v2Message(from, to, id, text) {
   }
 }
 
-test("real OpenCode processes provide concurrent exact injection, restart recovery, v1 interop, and held expiry ACK", { timeout: 60_000 }, async (t) => {
+test("real OpenCode hosts provide busy exact injection, restart recovery, permission boundaries, v1 interop, and held command ACKs", { timeout: 60_000 }, async (t) => {
   const found = spawnSync("which", ["opencode"], { encoding: "utf8" })
   if (found.status !== 0 || !found.stdout.trim()) return t.skip("opencode binary is unavailable")
   const binary = found.stdout.trim()
@@ -139,11 +159,17 @@ test("real OpenCode processes provide concurrent exact injection, restart recove
   let guarded
   try {
     const [alphaPort, betaPort, guardedPort] = await Promise.all([freePort(), freePort(), freePort()])
+    const betaControlFile = join(root, "beta-control.json")
+    const guardedControlFile = join(root, "guarded-control.json")
     alpha = await startOpenCode(binary, root, "alpha", join(root, "alpha"), dataDir, runtimeDir, pluginUrl, alphaPort)
-    beta = await startOpenCode(binary, root, "beta", join(root, "beta"), dataDir, runtimeDir, pluginUrl, betaPort)
+    beta = await startOpenCode(binary, root, "beta", join(root, "beta"), dataDir, runtimeDir, hostPluginUrl, betaPort, {
+      PEERS_FIXTURE_CONTROL_FILE: betaControlFile,
+      PEERS_FIXTURE_INBOUND_POLICY: "accept",
+    })
     const alphaSession = await createSession(alpha, "same-name")
     const betaOne = await createSession(beta, "same-name")
     const betaTwo = await createSession(beta, "same-name")
+    const betaControl = await fixtureControl(betaControlFile)
     let entries = await waitFor(async () => {
       const all = await registryEntries(peersDir)
       return all.filter((entry) => entry.version === 2 && alive(entry)).length >= 3 ? all : null
@@ -158,13 +184,44 @@ test("real OpenCode processes provide concurrent exact injection, restart recove
     await waitFor(async () => JSON.stringify(await sessionMessages(beta, betaTwo)).includes("REAL_EXACT_TARGET"))
     assert.equal(JSON.stringify(await sessionMessages(beta, betaOne)).includes("REAL_EXACT_TARGET"), false)
 
-    const first = transport.send(betaOneEndpoint, v2Message(alphaEndpoint, betaOneEndpoint, "real-busy-1", "REAL_BUSY_ONE"))
-    const second = transport.send(betaOneEndpoint, v2Message(alphaEndpoint, betaOneEndpoint, "real-busy-2", "REAL_BUSY_TWO"))
+    await callFixture(betaControl, "event", {
+      event: { type: "session.status", properties: { sessionID: betaOne.id, status: { type: "busy" } } },
+    })
+    entries = await waitFor(async () => {
+      const all = await registryEntries(peersDir)
+      return newest(all, (entry) => entry.version === 2 && entry.sessionId === betaOne.id && alive(entry) && entry.status === "busy") ? all : null
+    })
+    const busyEndpoint = newest(entries, (entry) => entry.version === 2 && entry.sessionId === betaOne.id && alive(entry))
+    assert.equal(busyEndpoint.status, "busy")
+    assert.equal(busyEndpoint.policy.peerPermissions, "allow")
+
+    const first = transport.send(busyEndpoint, v2Message(alphaEndpoint, busyEndpoint, "real-busy-1", "REAL_BUSY_ONE"))
+    const second = transport.send(busyEndpoint, v2Message(alphaEndpoint, busyEndpoint, "real-busy-2", "REAL_BUSY_TWO"))
     assert.deepEqual((await Promise.all([first, second])).map((result) => result.status), ["delivered", "delivered"])
     await waitFor(async () => {
       const body = JSON.stringify(await sessionMessages(beta, betaOne))
       return body.includes("REAL_BUSY_ONE") && body.includes("REAL_BUSY_TWO")
     })
+
+    const betaMessages = await sessionMessages(beta, betaOne)
+    const peerUserMessageID = messageIdContaining(betaMessages, "REAL_BUSY_ONE")
+    assert.ok(peerUserMessageID, "real injected peer-message provenance was not found")
+    const allowed = await callFixture(betaControl, "permission", {
+      sessionID: betaOne.id,
+      parentMessageID: peerUserMessageID,
+      permissionID: "real-allow",
+      permission: "bash",
+      patterns: ["pwd"],
+    })
+    assert.deepEqual(allowed.replies.map((reply) => [reply.permissionID, reply.response]), [["real-allow", "once"]])
+    const protectedResult = await callFixture(betaControl, "permission", {
+      sessionID: betaOne.id,
+      parentMessageID: peerUserMessageID,
+      permissionID: "real-native-deny-boundary",
+      permission: "edit",
+      patterns: ["AGENTS.md"],
+    })
+    assert.equal(protectedResult.replies.some((reply) => reply.permissionID === "real-native-deny-boundary"), false)
 
     const v1 = entries.find((entry) => entry.version === 1 && entry.instanceId === betaTwoEndpoint.processId)
     const v1Result = await Sender({ self: { instanceId: "legacy-real", name: "legacy", directory: root } }).send(v1, "REAL_V1_INTEROP")
@@ -176,17 +233,27 @@ test("real OpenCode processes provide concurrent exact injection, restart recove
     const listUrl = new URL(`http://127.0.0.1:${beta.port}/session`)
     listUrl.searchParams.set("directory", beta.directory)
     await (await fetch(listUrl)).json()
-    entries = await waitFor(async () => {
-      const all = await registryEntries(peersDir)
-      return newest(all, (entry) => entry.version === 2 && entry.sessionId === betaTwo.id && alive(entry) && existsSync(entry.transport.path ?? "")) ? all : null
-    })
+    try {
+      entries = await waitFor(async () => {
+        const all = await registryEntries(peersDir)
+        return newest(all, (entry) => entry.version === 2 && entry.sessionId === betaTwo.id && alive(entry) && existsSync(entry.transport.path ?? "")) ? all : null
+      }, 30_000)
+    } catch (error) {
+      const snapshot = await registryEntries(peersDir)
+      throw new Error(`restart discovery failed: ${error}; registry=${JSON.stringify(snapshot)}; logs=${beta.logs()}`)
+    }
     const restarted = newest(entries, (entry) => entry.version === 2 && entry.sessionId === betaTwo.id && alive(entry) && existsSync(entry.transport.path ?? ""))
     assert.equal(restarted.endpointId, oldEndpointId)
     assert.equal((await transport.send(restarted, v2Message(alphaEndpoint, restarted, "real-restart", "REAL_AFTER_RESTART"))).status, "delivered")
     await waitFor(async () => JSON.stringify(await sessionMessages(beta, betaTwo)).includes("REAL_AFTER_RESTART"))
 
-    guarded = await startOpenCode(binary, root, "guarded", join(root, "guarded"), dataDir, runtimeDir, holdPluginUrl, guardedPort)
+    guarded = await startOpenCode(binary, root, "guarded", join(root, "guarded"), dataDir, runtimeDir, hostPluginUrl, guardedPort, {
+      PEERS_FIXTURE_CONTROL_FILE: guardedControlFile,
+      PEERS_FIXTURE_PERMISSION_MODE: "ask",
+      PEERS_FIXTURE_INBOUND_POLICY: "hold",
+    })
     const guardedSession = await createSession(guarded, "guarded")
+    const guardedControl = await fixtureControl(guardedControlFile)
     entries = await waitFor(async () => {
       const all = await registryEntries(peersDir)
       return newest(all, (entry) => entry.version === 2 && entry.sessionId === guardedSession.id && alive(entry) && existsSync(entry.transport.path ?? "")) ? all : null
@@ -194,12 +261,46 @@ test("real OpenCode processes provide concurrent exact injection, restart recove
     const guardedEndpoint = newest(entries, (entry) => entry.version === 2 && entry.sessionId === guardedSession.id && alive(entry) && existsSync(entry.transport.path ?? ""))
     assert.deepEqual(guardedEndpoint.policy, { inboundPolicy: "hold", peerPermissions: "ask" })
     assert.equal(alphaEndpoint.policy.peerPermissions, "allow")
-    const held = v2Message(alphaEndpoint, guardedEndpoint, "real-held-expiry", "REAL_HELD_EXPIRY")
     const outbox = Outbox({ storageDir: pluginStorage })
-    await outbox.recordPending(held, guardedEndpoint.name)
-    assert.equal((await transport.send(guardedEndpoint, held)).status, "held")
-    const final = await waitFor(async () => outbox.get(alphaEndpoint.endpointId, held.messageId)?.finalStatus)
-    assert.equal(final, "expired")
+    const acceptedHeld = v2Message(alphaEndpoint, guardedEndpoint, "real-held-accept", "REAL_HELD_ACCEPT")
+    await outbox.recordPending(acceptedHeld, guardedEndpoint.name)
+    assert.equal((await transport.send(guardedEndpoint, acceptedHeld)).status, "held")
+    const acceptedCommand = await callFixture(guardedControl, "command", {
+      sessionID: guardedSession.id,
+      command: "peers-inbox",
+      arguments: "accept 1",
+    })
+    assert.match(JSON.stringify(acceptedCommand.output), /Accepted 1 message\(s\); delivered/)
+    assert.equal(await waitFor(async () => outbox.get(alphaEndpoint.endpointId, acceptedHeld.messageId)?.finalStatus), "delivered")
+    const guardedMessages = await waitFor(async () => {
+      const messages = await sessionMessages(guarded, guardedSession)
+      return messageIdContaining(messages, "REAL_HELD_ACCEPT") ? messages : null
+    })
+    const guardedPeerMessageID = messageIdContaining(guardedMessages, "REAL_HELD_ACCEPT")
+    const asked = await callFixture(guardedControl, "permission", {
+      sessionID: guardedSession.id,
+      parentMessageID: guardedPeerMessageID,
+      permissionID: "real-ask",
+      permission: "bash",
+      patterns: ["pwd"],
+    })
+    assert.deepEqual(asked.replies, [])
+
+    const droppedHeld = v2Message(alphaEndpoint, guardedEndpoint, "real-held-drop", "REAL_HELD_DROP")
+    await outbox.recordPending(droppedHeld, guardedEndpoint.name)
+    assert.equal((await transport.send(guardedEndpoint, droppedHeld)).status, "held")
+    const droppedCommand = await callFixture(guardedControl, "command", {
+      sessionID: guardedSession.id,
+      command: "peers-inbox",
+      arguments: "drop 1",
+    })
+    assert.match(JSON.stringify(droppedCommand.output), /Dropped 1 message/)
+    assert.equal(await waitFor(async () => outbox.get(alphaEndpoint.endpointId, droppedHeld.messageId)?.finalStatus), "dropped")
+
+    const expiredHeld = v2Message(alphaEndpoint, guardedEndpoint, "real-held-expiry", "REAL_HELD_EXPIRY")
+    await outbox.recordPending(expiredHeld, guardedEndpoint.name)
+    assert.equal((await transport.send(guardedEndpoint, expiredHeld)).status, "held")
+    assert.equal(await waitFor(async () => outbox.get(alphaEndpoint.endpointId, expiredHeld.messageId)?.finalStatus), "expired")
   } finally {
     await Promise.all([stopOpenCode(guarded), stopOpenCode(beta), stopOpenCode(alpha)])
     await rm(root, { recursive: true, force: true })

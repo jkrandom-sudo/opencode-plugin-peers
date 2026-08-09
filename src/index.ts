@@ -17,7 +17,7 @@
  * $XDG_DATA_HOME/opencode-plugin-peers/peers.d/ and runs a 127.0.0.1-only
  * inbox HTTP listener (random port, bearer token). Peers POST to the
  * listener; the receiving instance injects into its own session via the
- * opencode SDK when idle.
+ * opencode SDK immediately, including while the target session is busy.
  */
 
 import { basename } from "node:path"

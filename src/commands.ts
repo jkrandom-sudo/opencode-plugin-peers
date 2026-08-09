@@ -116,7 +116,7 @@ async function handleInbox(ctx: CommandContext, args: string): Promise<CommandRe
       handled: true,
       message: delivered
         ? `✅ Accepted ${accepted.length} message(s); delivered.`
-        : `✅ Accepted ${accepted.length} message(s); queued until the session is idle.`,
+        : `✅ Accepted ${accepted.length} message(s); queued for immediate-delivery retry; final ACK remains pending for the sender.`,
     }
   }
 

@@ -25,7 +25,7 @@ export interface DeliveryOptions {
 }
 
 export interface DeliveryInstance {
-  /** Flush if idle. Returns true when at least one message was delivered. */
+  /** Flush queued messages. Returns true when at least one message was delivered. */
   flush: () => Promise<boolean>
   /**
    * Show a display-only notification inline (e.g. "held message awaiting

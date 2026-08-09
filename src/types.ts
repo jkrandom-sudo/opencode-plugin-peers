@@ -160,7 +160,7 @@ export interface PluginConfig {
   heartbeatMs?: number
   /** A peer is stale if its heartbeat is older than this. Default 30_000. */
   staleMs?: number
-  /** Max queued messages awaiting idle. Default 50. */
+  /** Max queued messages awaiting an immediate-delivery retry. Default 50. */
   maxQueue?: number
   /** Max held messages. Default 100. */
   maxHeld?: number
