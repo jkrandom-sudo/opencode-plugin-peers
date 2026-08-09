@@ -93,6 +93,47 @@ test("send_message resolves by name and by instanceId", async () => {
   assert.equal(sender.calls.length, 2)
 })
 
+test("send_message gives canonical v2 endpointId precedence without a v1 instanceId alias", async () => {
+  const now = Date.now()
+  const v2 = {
+    version: 2,
+    endpointId: "session-exact-v2",
+    processId: "process-v2",
+    pid: process.pid,
+    sessionId: "ses_v2",
+    title: "v2",
+    name: "shared-name",
+    hostname: "h",
+    directory: "/tmp/v2",
+    status: "idle",
+    transport: { type: "unix", path: "/tmp/v2.sock" },
+    serverUrl: "",
+    inboxUrl: "http+unix://v2",
+    inboxToken: "token",
+    capabilities: ["local", "protocol-v2", "prompt-async", "ack"],
+    timestamps: { startedAt: now, updatedAt: now, heartbeatAt: now },
+    policy: { inboundPolicy: "accept", peerPermissions: "allow" },
+    pluginVersion: "0.1.7",
+    activeSessionId: "ses_v2",
+    activeSessionTitle: "v2",
+    busy: false,
+    queuedCount: 0,
+    inboundPolicy: "accept",
+    startedAt: now,
+    heartbeatAt: now,
+  }
+  const collision = peerEntry({ instanceId: "legacy-other", name: "session-exact-v2" })
+  const { tools, sender } = makeTools({ listed: [
+    { entry: v2, alive: true, staleReason: null },
+    { entry: collision, alive: true, staleReason: null },
+  ] })
+
+  const result = await tools.send_message.execute({ to: "session-exact-v2", message: "hi" }, {})
+  assert.match(result, /delivered/)
+  assert.equal(sender.calls.length, 1)
+  assert.equal(sender.calls[0].entry.endpointId, "session-exact-v2")
+})
+
 test("send_message reports unknown, offline and ambiguous targets", async () => {
   const listed = [
     { entry: peerEntry(), alive: true, staleReason: null },

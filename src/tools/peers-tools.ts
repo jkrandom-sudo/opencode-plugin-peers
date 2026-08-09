@@ -17,6 +17,11 @@ export interface ToolsDeps {
   maxMessageBytes: number
   selfName: () => string
   selfInstanceId: string
+  endpointForSession?: (sessionId: string) => { endpointId: string; name: string; directory: string } | null
+}
+
+function entryId(entry: ListedPeer["entry"]): string {
+  return entry.version === 2 ? entry.endpointId : entry.instanceId
 }
 
 export function formatPeerList(peers: ListedPeer[], selfName: string, selfId: string): string {
@@ -29,18 +34,19 @@ export function formatPeerList(peers: ListedPeer[], selfName: string, selfId: st
     lines.push(`${online.length} peer(s) online:`)
     for (const p of online) {
       const e = p.entry
+      const id = entryId(e)
       const session = e.activeSessionId
         ? `session ${e.activeSessionTitle ? `"${e.activeSessionTitle}" ` : ""}(${e.activeSessionId})`
         : "(no active session)"
       lines.push(
-        `- "${e.name}" (id ${e.instanceId}) — ${e.directory} — ${session} — inbound: ${e.inboundPolicy}`
+        `- "${e.name}" (id ${id}) — ${e.directory} — ${session} — inbound: ${e.inboundPolicy}`
       )
     }
   }
   if (offline.length > 0) {
     lines.push(`${offline.length} peer(s) stale/offline (hidden from targeting):`)
     for (const p of offline) {
-      lines.push(`- "${p.entry.name}" (id ${p.entry.instanceId}) — ${p.staleReason}`)
+      lines.push(`- "${p.entry.name}" (id ${entryId(p.entry)}) — ${p.staleReason}`)
     }
   }
   lines.push(`You are "${selfName}" (id ${selfId}).`)
@@ -51,47 +57,55 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
   return {
     list_agents: tool({
       description:
-        "List other opencode instances on this machine that you can exchange plain-text messages with (cross-session messaging). Shows each peer's name, id, directory, active session and inbound policy.",
+        "List other opencode session endpoints on this machine that you can exchange plain-text messages with. Shows each endpoint's name, id, directory, session and inbound policy.",
       args: {
         include_offline: z
           .boolean()
           .optional()
           .describe("Also list stale/offline registry entries (default false)"),
       },
-      async execute(args) {
+      async execute(args, context) {
         let peers: ListedPeer[]
         try {
           peers = await deps.registry.list()
         } catch (err) {
           return `Failed to read peer registry: ${String(err)}`
         }
-        const shown = args.include_offline ? peers : peers.filter((p) => p.alive)
-        return formatPeerList(shown, deps.selfName(), deps.selfInstanceId)
+        const self = deps.endpointForSession?.(context.sessionID)
+        const selfId = self?.endpointId ?? deps.selfInstanceId
+        const shown = (args.include_offline ? peers : peers.filter((p) => p.alive))
+          .filter((peer) => entryId(peer.entry) !== selfId)
+        return formatPeerList(shown, self?.name ?? deps.selfName(), selfId)
       },
     }),
 
     send_message: tool({
       description:
-        "Send a plain-text message to another opencode session on this machine. The peer receives it as an ordinary user message when its session is idle. Text only — no files, no conversation history. Resolve the target with list_agents first if unsure.",
+        "Send a plain-text message immediately to an exact opencode session on this machine, including while it is busy. Text only — no files or conversation history. Resolve the target with list_agents first if unsure.",
       args: {
         to: z.string().describe("Peer name or instanceId (see list_agents)"),
         message: z.string().describe("Plain-text message body"),
       },
-      async execute(args) {
+      async execute(args, context) {
         const text = args.message
         if (!text.trim()) return "Error: message must not be empty."
         if (Buffer.byteLength(text, "utf8") > deps.maxMessageBytes) {
           return `Error: message exceeds ${deps.maxMessageBytes} bytes.`
         }
 
-        const peers = (await deps.registry.list()).filter((p) => p.alive)
+        const self = deps.endpointForSession?.(context.sessionID)
+        if (deps.endpointForSession && !self) {
+          return `Error: sender session "${context.sessionID}" is not registered.`
+        }
+        const selfId = self?.endpointId ?? deps.selfInstanceId
+        const listed = await deps.registry.list()
+        const peers = listed.filter((p) => p.alive && entryId(p.entry) !== selfId)
         const target = args.to.trim()
-        const matches = peers.filter(
-          (p) => p.entry.name === target || p.entry.instanceId === target
-        )
+        const exact = peers.find((p) => entryId(p.entry) === target)
+        const matches = exact ? [exact] : peers.filter((p) => p.entry.name === target)
         if (matches.length === 0) {
-          const stale = (await deps.registry.list()).find(
-            (p) => !p.alive && (p.entry.name === target || p.entry.instanceId === target)
+          const stale = listed.find(
+            (p) => !p.alive && (p.entry.name === target || entryId(p.entry) === target)
           )
           if (stale) {
             return `Error: peer "${target}" appears offline (${stale.staleReason}).`
@@ -101,17 +115,21 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
         }
         if (matches.length > 1) {
           const candidates = matches
-            .map((p) => `"${p.entry.name}" (id ${p.entry.instanceId})`)
+            .map((p) => `"${p.entry.name}" (id ${entryId(p.entry)})`)
             .join(", ")
           return `Error: "${target}" is ambiguous. Candidates: ${candidates}. Use an instanceId.`
         }
 
         const peer = matches[0].entry
-        if (!deps.sendLimit(peer.instanceId)) {
+        if (!deps.sendLimit(entryId(peer))) {
           return `Error: outbound rate limit reached for "${peer.name}"; try again in a minute.`
         }
 
-        const result = await deps.sender.send(peer, text)
+        const result = await deps.sender.send(peer, text, self ? {
+          instanceId: self.endpointId,
+          name: self.name,
+          directory: self.directory,
+        } : undefined)
         if (!result.ok) return `Error: ${result.error}`
         switch (result.status) {
           case "delivered":

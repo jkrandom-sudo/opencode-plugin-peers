@@ -63,7 +63,7 @@ export function PeerPermissions(opts: PeerPermissionsOptions): PeerPermissionsIn
     return {
       role: data.info?.role,
       parentID: data.info?.parentID,
-      isPeer: Boolean(data.parts?.some((p) => p.metadata?.peerMessage === true)),
+      isPeer: Boolean(data.parts?.some((p) => Boolean(p.metadata?.peerMessage))),
     }
   }
 

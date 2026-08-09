@@ -4,10 +4,25 @@
  * so inbound gating (accept/hold/refuse) and queueing stay under our control.
  */
 
+import { chmod, mkdir, rm } from "node:fs/promises"
 import { createServer, type Server } from "node:http"
 import type { AddressInfo } from "node:net"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { z } from "zod"
-import type { InboundMessage, Logger, PeerMessageV2, ReceiveStatus } from "./types.js"
+import type {
+  InboundMessage,
+  LocalTransportAddress,
+  Logger,
+  PeerAcknowledgementV2,
+  PeerMessageV2,
+  ReceiveStatus,
+} from "./types.js"
+
+export interface MessageRoute {
+  version: 1 | 2
+  toEndpointId?: string
+}
 
 export interface ListenerOptions {
   token: string
@@ -16,12 +31,17 @@ export interface ListenerOptions {
   maxMessageBytes?: number
   /** Maximum permitted clock age/skew for a sender timestamp. */
   maxMessageAgeMs?: number
-  onMessage: (msg: InboundMessage) => Promise<ReceiveStatus>
+  runtimeDir?: string
+  processId?: string
+  platform?: NodeJS.Platform
+  resolveEndpoint?: (route: MessageRoute) => string | null
+  onMessage: (msg: InboundMessage, endpointId?: string) => Promise<ReceiveStatus>
+  onAcknowledgement?: (ack: PeerAcknowledgementV2) => Promise<void>
   logger: Logger
 }
 
 export interface ListenerInstance {
-  start: () => Promise<{ port: number; url: string }>
+  start: () => Promise<{ port: number; url: string; address: LocalTransportAddress }>
   stop: () => Promise<void>
 }
 
@@ -58,6 +78,15 @@ const inboundMessageV2Schema = z
   })
   .passthrough()
 
+const acknowledgementV2Schema = z.object({
+  version: z.literal(2),
+  messageId: z.string().min(1),
+  fromEndpointId: z.string().min(1),
+  toEndpointId: z.string().min(1),
+  status: z.enum(["delivered", "refused", "expired", "dropped", "duplicate"]),
+  acknowledgedAt: z.number().finite(),
+}).passthrough()
+
 function statusToHttp(status: ReceiveStatus): number {
   switch (status) {
     case "refused":
@@ -69,25 +98,37 @@ function statusToHttp(status: ReceiveStatus): number {
   }
 }
 
-function parseMessage(body: unknown): InboundMessage | null {
+function parseMessage(body: unknown): { message: InboundMessage; route: MessageRoute } | null {
   if (typeof body === "object" && body !== null && "version" in body && body.version === 2) {
     const parsed = inboundMessageV2Schema.safeParse(body)
     if (!parsed.success) return null
     const message = parsed.data as PeerMessageV2
     return {
-      id: message.messageId,
-      from: {
-        instanceId: message.fromEndpointId,
-        name: message.from.name,
-        directory: message.from.directory,
+      message: {
+        id: message.messageId,
+        from: {
+          instanceId: message.fromEndpointId,
+          name: message.from.name,
+          directory: message.from.directory,
+        },
+        text: message.text,
+        via: message.via,
+        sentAt: message.sentAt,
       },
-      text: message.text,
-      via: message.via,
-      sentAt: message.sentAt,
+      route: { version: 2, toEndpointId: message.toEndpointId },
     }
   }
   const parsed = inboundMessageV1Schema.safeParse(body)
-  return parsed.success ? parsed.data : null
+  return parsed.success ? { message: parsed.data, route: { version: 1 } } : null
+}
+
+export function defaultRuntimeDirectory(
+  env: NodeJS.ProcessEnv = process.env,
+  uid = typeof process.getuid === "function" ? process.getuid() : 0
+): string {
+  return env.XDG_RUNTIME_DIR
+    ? join(env.XDG_RUNTIME_DIR, "opencode-plugin-peers")
+    : join(tmpdir(), `ocp-${uid}`)
 }
 
 export function InboxListener(opts: ListenerOptions): ListenerInstance {
@@ -116,7 +157,7 @@ export function InboxListener(opts: ListenerOptions): ListenerInstance {
       return
     }
 
-    if (req.method !== "POST" || req.url !== "/message") {
+    if (req.method !== "POST" || (req.url !== "/message" && req.url !== "/ack")) {
       send(404, { error: "not found" })
       return
     }
@@ -141,11 +182,23 @@ export function InboxListener(opts: ListenerOptions): ListenerInstance {
       return
     }
 
-    const msg = parseMessage(parsed)
-    if (!msg) {
+    if (req.url === "/ack") {
+      const ack = acknowledgementV2Schema.safeParse(parsed)
+      if (!ack.success) {
+        send(400, { error: "invalid acknowledgement shape" })
+        return
+      }
+      await opts.onAcknowledgement?.(ack.data)
+      send(202, { status: "accepted" })
+      return
+    }
+
+    const envelope = parseMessage(parsed)
+    if (!envelope) {
       send(400, { error: "invalid message shape" })
       return
     }
+    const msg = envelope.message
     if (Buffer.byteLength(msg.text, "utf8") > (opts.maxMessageBytes ?? 8192)) {
       send(413, { error: "message too large" })
       return
@@ -156,7 +209,12 @@ export function InboxListener(opts: ListenerOptions): ListenerInstance {
     }
 
     try {
-      const status = await opts.onMessage(msg)
+      const endpointId = opts.resolveEndpoint?.(envelope.route)
+      if (opts.resolveEndpoint && !endpointId) {
+        send(404, { error: "endpoint not found" })
+        return
+      }
+      const status = await opts.onMessage(msg, endpointId ?? envelope.route.toEndpointId)
       send(statusToHttp(status), { status })
     } catch (err) {
       await opts.logger("error", "onMessage handler failed", { error: String(err) })
@@ -166,7 +224,7 @@ export function InboxListener(opts: ListenerOptions): ListenerInstance {
 
   return {
     start() {
-      return new Promise((resolve, reject) => {
+      return new Promise(async (resolve, reject) => {
         server = createServer((req, res) => {
           handle(req, res).catch((err) => {
             opts.logger("error", "listener error", { error: String(err) })
@@ -178,9 +236,42 @@ export function InboxListener(opts: ListenerOptions): ListenerInstance {
           })
         })
         server.once("error", reject)
+        // Keep direct legacy InboxListener callers on loopback TCP. The
+        // process runtime passes a processId and therefore selects the
+        // platform-default UDS path on macOS/Linux.
+        const platform = opts.platform ?? (opts.processId ? process.platform : "win32")
+        if (platform !== "win32") {
+          const directory = opts.runtimeDir ?? defaultRuntimeDirectory()
+          const socketPath = join(directory, `${opts.processId ?? process.pid}.sock`)
+          try {
+            await mkdir(directory, { recursive: true, mode: 0o700 })
+            await chmod(directory, 0o700)
+            await rm(socketPath, { force: true })
+          } catch (err) {
+            reject(err)
+            return
+          }
+          server.listen(socketPath, async () => {
+            try {
+              await chmod(socketPath, 0o600)
+              resolve({
+                port: 0,
+                url: `http+unix://${encodeURIComponent(socketPath)}`,
+                address: { type: "unix", path: socketPath },
+              })
+            } catch (err) {
+              reject(err)
+            }
+          })
+          return
+        }
         server.listen(0, "127.0.0.1", () => {
           const addr = server!.address() as AddressInfo
-          resolve({ port: addr.port, url: `http://127.0.0.1:${addr.port}` })
+          resolve({
+            port: addr.port,
+            url: `http://127.0.0.1:${addr.port}`,
+            address: { type: "tcp", host: "127.0.0.1", port: addr.port },
+          })
         })
       })
     },
@@ -188,7 +279,11 @@ export function InboxListener(opts: ListenerOptions): ListenerInstance {
     stop() {
       return new Promise((resolve) => {
         if (!server) return resolve()
-        server.close(() => resolve())
+        const address = server.address()
+        server.close(() => {
+          if (typeof address === "string") void rm(address, { force: true }).finally(resolve)
+          else resolve()
+        })
         server = null
       })
     },

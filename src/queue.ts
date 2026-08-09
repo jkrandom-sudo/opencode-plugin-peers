@@ -45,6 +45,26 @@ export function stableSpoolEndpointId(directory: string): string {
   return `workspace-${digest.slice(0, 24)}`
 }
 
+export function stableSessionEndpointId(sessionId: string): string {
+  const digest = createHash("sha256").update(`session-v1\0${sessionId}`).digest("hex")
+  return `session-${digest.slice(0, 24)}`
+}
+
+export function createSessionMessageQueue(opts: {
+  config: ResolvedConfig
+  sessionId: string
+  logger: Logger
+}): QueueInstance {
+  return MessageQueue({
+    endpointId: stableSessionEndpointId(opts.sessionId),
+    maxQueue: opts.config.maxQueue,
+    maxHeld: opts.config.maxHeld,
+    heldExpiryMs: opts.config.heldExpiryMs,
+    inboxFile: opts.config.inboxFile,
+    logger: opts.logger,
+  })
+}
+
 export function createProcessMessageQueue(opts: {
   config: ResolvedConfig
   directory: string

@@ -1,10 +1,12 @@
 /**
- * Delivery: flush queued peer messages into the active session once it is
- * idle. Injection goes through our own opencode server's session.prompt API,
+ * Delivery: inject durable queued messages into one exact local session.
+ * Protocol-v2 injection uses promptAsync immediately, including while busy.
+ * Injection goes through our own opencode server's session.prompt API,
  * so a peer message is an ordinary (synthetic) user message — it cannot
  * approve permissions, edit config, or run slash commands.
  */
 
+import { createHash } from "node:crypto"
 import type { PluginInput } from "@opencode-ai/plugin"
 import type { InboundMessage, Logger } from "./types.js"
 import type { QueueInstance } from "./queue.js"
@@ -18,6 +20,8 @@ export interface DeliveryOptions {
   queue: QueueInstance
   directory: string
   logger: Logger
+  /** Protocol-v2 delivery targets this session immediately, even while busy. */
+  immediate?: boolean
 }
 
 export interface DeliveryInstance {
@@ -50,63 +54,108 @@ export function formatMessages(messages: InboundMessage[]): string {
   return blocks.join("\n\n") + "\n\n" + FOOTER
 }
 
+export function deterministicPeerMessageId(sessionId: string, message: InboundMessage): string {
+  const digest = createHash("sha256")
+    .update(`peer-message-v2\0${sessionId}\0${message.from.instanceId}\0${message.id}`)
+    .digest("hex")
+  return `msg_${digest.slice(0, 26)}`
+}
+
 export function Delivery(opts: DeliveryOptions): DeliveryInstance {
   let flushing = false
 
-  async function inject(sessionId: string, text: string): Promise<void> {
+  async function inject(sessionId: string, text: string, message?: InboundMessage): Promise<void> {
     const part = {
       type: "text" as const,
       text,
       synthetic: true,
-      metadata: { peerMessage: true },
+      metadata: {
+        peerMessage: message ? {
+          version: 2,
+          messageId: message.id,
+          fromEndpointId: message.from.instanceId,
+          toSessionId: sessionId,
+        } : true,
+      },
     }
+    const messageID = message ? deterministicPeerMessageId(sessionId, message) : undefined
     const session = opts.client.session as unknown as Record<string, unknown>
     if (typeof session.promptAsync === "function") {
       await (session.promptAsync as (a: unknown) => Promise<unknown>)({
         path: { id: sessionId },
-        body: { parts: [part] },
+        body: { ...(messageID ? { messageID } : {}), parts: [part] },
         query: { directory: opts.directory },
       })
       return
     }
     await opts.client.session.prompt({
       path: { id: sessionId },
-      body: { parts: [part] },
+      body: { ...(messageID ? { messageID } : {}), parts: [part] },
       query: { directory: opts.directory },
     })
   }
 
-  return {
-    async flush() {
-      if (flushing) return false
-      if (!opts.tracker.isIdle()) return false
-      const sessionId = opts.tracker.activeSessionId()
-      if (!sessionId) return false
-      if (opts.queue.size() === 0) return false
+  async function flushOnce(): Promise<boolean> {
+    if (flushing) return false
+    const sessionId = opts.tracker.activeSessionId()
+    if (!sessionId) return false
+    if (opts.queue.size() === 0) return false
+    if (!opts.immediate && !opts.tracker.isIdle()) return false
 
-      flushing = true
-      try {
-        const messages = opts.queue.drain()
-        try {
-          await inject(sessionId, formatMessages(messages))
-          await opts.queue.complete(messages)
-          await opts.logger("info", "delivered peer messages", {
-            count: messages.length,
-            sessionId,
-          })
-          return true
-        } catch (err) {
-          // Put messages back (order preserved) so a later flush can retry.
-          await opts.queue.requeue(messages)
-          await opts.logger("error", "failed to deliver peer messages", {
-            error: String(err),
-            sessionId,
-          })
-          return false
+    flushing = true
+    try {
+      const messages = opts.queue.drain()
+      if (opts.immediate) {
+        let delivered = 0
+        for (let index = 0; index < messages.length; index++) {
+          const message = messages[index]
+          try {
+            await inject(sessionId, formatMessages([message]), message)
+            await opts.queue.complete([message])
+            delivered++
+          } catch (err) {
+            await opts.queue.requeue(messages.slice(index))
+            await opts.logger("error", "failed to deliver peer message", {
+              error: String(err),
+              sessionId,
+              messageId: message.id,
+            })
+            return delivered > 0
+          }
         }
-      } finally {
-        flushing = false
+        await opts.logger("info", "delivered peer messages", { count: delivered, sessionId })
+        return delivered > 0
       }
+      try {
+        await inject(sessionId, formatMessages(messages))
+        await opts.queue.complete(messages)
+        await opts.logger("info", "delivered peer messages", {
+          count: messages.length,
+          sessionId,
+        })
+        return true
+      } catch (err) {
+        // Put messages back (order preserved) so a later flush can retry.
+        await opts.queue.requeue(messages)
+        await opts.logger("error", "failed to deliver peer messages", {
+          error: String(err),
+          sessionId,
+        })
+        return false
+      }
+    } finally {
+      flushing = false
+    }
+  }
+
+  let immediateTail: Promise<boolean> = Promise.resolve(false)
+
+  return {
+    flush() {
+      if (!opts.immediate) return flushOnce()
+      const pending = immediateTail.then(flushOnce, flushOnce)
+      immediateTail = pending.catch(() => false)
+      return pending
     },
 
     async notice(text: string) {

@@ -8,7 +8,7 @@
  *   - list_agents / send_message tools for the agent
  *   - /peers, /peers-name, /peers-inbox commands for the user
  *   - accept/hold/refuse inbound gating
- *   - busy sessions queue messages; delivery happens on session.idle
+ *   - each session is independently addressable and receives peer messages immediately
  *   - messages are ordinary (synthetic) user messages: no shared history,
  *     no file transfer; permissions in peer-triggered turns are governed
  *     by the peerPermissions option (default: auto-allow)
@@ -25,13 +25,11 @@ import type { Hooks, Plugin, PluginModule } from "@opencode-ai/plugin"
 import { resolveConfig } from "./config.js"
 import { Registry, newInboxToken, newInstanceId, uniqueName } from "./registry.js"
 import { InboxListener } from "./listener.js"
-import { createProcessMessageQueue, RateLimiter } from "./queue.js"
+import { RateLimiter } from "./queue.js"
 import type { QueueInstance } from "./queue.js"
-import { SessionTracker } from "./session-tracker.js"
-import { Delivery } from "./delivery.js"
+import { SessionRuntime } from "./session-runtime.js"
 import type { DeliveryInstance } from "./delivery.js"
 import { Sender } from "./sender.js"
-import { gateMessage } from "./gating.js"
 import { PeerPermissions } from "./permissions.js"
 import { buildPeerTools } from "./tools/peers-tools.js"
 import { handlePeersCommand } from "./commands.js"
@@ -60,24 +58,17 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
 
   const instanceId = newInstanceId()
   const inboxToken = newInboxToken()
-  const tracker = SessionTracker()
-  const queue = createProcessMessageQueue({
-    config,
-    directory: ctx.directory,
-    logger,
-  })
-  await queue.loadHeld()
 
   let currentName = config.name || basename(ctx.directory) || "opencode"
   let policy: InboundPolicy = config.inboundPolicy
-
-  const delivery = Delivery({
+  const runtime = SessionRuntime({
     client: ctx.client,
-    tracker,
-    queue,
+    config,
     directory: ctx.directory,
+    name: () => currentName,
     logger,
   })
+  await runtime.initialize()
 
   const recvLimit = RateLimiter(config.recvRatePerMin)
   const sendLimit = RateLimiter(config.sendRatePerMin)
@@ -87,31 +78,23 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     maxBodyBytes: config.maxMessageBytes * 2 + 4096,
     maxMessageBytes: config.maxMessageBytes,
     maxMessageAgeMs: config.maxMessageAgeMs,
+    processId: instanceId,
+    resolveEndpoint: ({ version, toEndpointId }) => {
+      if (version === 1) return runtime.compatibilityEndpointId()
+      return toEndpointId && runtime.hasEndpoint(toEndpointId) ? toEndpointId : null
+    },
     logger,
-    onMessage: async (msg): Promise<ReceiveStatus> => {
-      const existing = queue.existingStatus(msg)
-      if (existing) return existing
-      if (queue.isDebounced(msg)) return "duplicate"
+    onMessage: async (msg, endpointId): Promise<ReceiveStatus> => {
       if (!recvLimit(msg.from.instanceId)) return "full"
-      const decision = gateMessage(policy, msg)
-      if (decision === "refuse") {
-        const ack = await queue.refuse(msg)
-        return ack.status === "duplicate" ? (queue.existingStatus(msg) ?? "duplicate") : ack.status
-      }
-      if (decision === "hold") {
-        const ok = await queue.hold(msg)
-        if (!ok) return "full"
-        // Fire-and-forget: inbound handling must not block on UX feedback.
-        void delivery.notice(`📥 Held message from "${msg.from.name}" — /peers-inbox to review`)
-        return "held"
-      }
-      if (!queue.enqueue(msg)) return "full"
-      const delivered = await delivery.flush()
-      return delivered ? "delivered" : "queued"
+      return runtime.receive(msg, endpointId!, policy)
     },
   })
 
-  const { url: inboxUrl } = await listener.start()
+  const { url: inboxUrl, address: transport } = await listener.start()
+
+  const latestEndpoint = () => runtime.registryEndpoints()
+    .slice()
+    .sort((a, b) => b.updatedAt - a.updatedAt)[0]
 
   const registry = Registry({
     peersDir: config.peersDir,
@@ -124,28 +107,23 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     pluginVersion: PLUGIN_VERSION,
     heartbeatMs: config.heartbeatMs,
     staleMs: config.staleMs,
-    getDynamic: () => ({
-      name: currentName,
-      inboundPolicy: policy,
-      activeSessionId: tracker.activeSessionId(),
-      activeSessionTitle: tracker.activeSessionTitle(),
-      busy: tracker.activeSessionId() != null && !tracker.isIdle(),
-      queuedCount: queue.size(),
-    }),
+    getDynamic: () => {
+      const latest = latestEndpoint()
+      return {
+        name: currentName,
+        inboundPolicy: policy,
+        activeSessionId: latest?.sessionId ?? null,
+        activeSessionTitle: latest?.title ?? null,
+        busy: latest ? latest.status !== "idle" : false,
+        queuedCount: latest?.queuedCount ?? 0,
+      }
+    },
+    getEndpoints: runtime.registryEndpoints,
+    transport,
+    peerPermissions: config.peerPermissions,
     logger,
   })
 
-  // Resolve name conflicts before announcing ourselves.
-  const unique = uniqueName(currentName, await registry.list())
-  if (unique.changed) {
-    // No session exists yet at init, so there is no inline channel — the
-    // final name is visible via /peers.
-    await logger("info", `name "${currentName}" was taken; registered as "${unique.name}"`, {
-      requested: currentName,
-      assigned: unique.name,
-    })
-    currentName = unique.name
-  }
   await registry.start()
 
   const sender = Sender({
@@ -160,17 +138,9 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     },
   })
 
-  const flushIfIdle = async (): Promise<void> => {
-    try {
-      await delivery.flush()
-    } catch (err) {
-      await logger("error", "flush failed", { error: errorMessage(err) })
-    }
-  }
-
   const sweepReliability = async (): Promise<void> => {
     try {
-      await runReliabilitySweep(queue, delivery)
+      await runtime.sweep()
     } catch (err) {
       await logger("error", "reliability sweep failed", { error: errorMessage(err) })
     }
@@ -193,31 +163,22 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   const hooks: Hooks = {
     event: async ({ event }) => {
       const e = event as { type?: string; properties?: Record<string, unknown> }
-      const sid = (e.properties?.sessionID ?? e.properties?.sessionId) as string | undefined
-      switch (e.type) {
-        case "session.idle":
-          tracker.noteIdle(sid)
-          await flushIfIdle()
-          break
-        case "session.created":
-          if (sid && !tracker.activeSessionId()) tracker.noteIdle(sid)
-          break
-        case "session.deleted":
-          if (sid) tracker.noteDeleted(sid)
-          break
-        default:
-          await permissions.handleEvent(e)
-          break
-      }
+      const changed = await runtime.handleEvent(e)
+      if (changed) await registry.heartbeat()
+      await permissions.handleEvent(e)
     },
 
     "chat.message": async (input) => {
-      tracker.noteUserActivity(input.sessionID)
+      await runtime.noteActivity(input.sessionID)
+      await registry.heartbeat()
     },
 
     "command.execute.before": async (input, output) => {
       if (!COMMAND_NAMES.has(input.command)) return
-      tracker.noteUserActivity(input.sessionID)
+      await runtime.noteActivity(input.sessionID)
+      const queue = runtime.queueForSession(input.sessionID)
+      const delivery = runtime.deliveryForSession(input.sessionID)
+      if (!queue || !delivery) return
       let message: string
       try {
         const result = await handlePeersCommand(
@@ -227,10 +188,9 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
             delivery,
             getName: () => currentName,
             setName: async (name) => {
-              const u = uniqueName(name, await registry.list())
-              currentName = u.name
+              currentName = name
               await registry.heartbeat()
-              return u
+              return { name, changed: false }
             },
             selfInstanceId: instanceId,
           },
@@ -255,6 +215,13 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     maxMessageBytes: config.maxMessageBytes,
     selfName: () => currentName,
     selfInstanceId: instanceId,
+    endpointForSession: (sessionId) => {
+      const endpointId = runtime.endpointIdForSession(sessionId)
+      const endpoint = runtime.registryEndpoints().find((entry) => entry.sessionId === sessionId)
+      return endpointId && endpoint
+        ? { endpointId, name: endpoint.name, directory: endpoint.directory }
+        : null
+    },
   })
 
   hooks.dispose = async () => {
@@ -282,11 +249,26 @@ export const plugin: PluginModule = {
 export default plugin
 
 export { Registry, uniqueName } from "./registry.js"
-export { MessageQueue, RateLimiter, createProcessMessageQueue, stableSpoolEndpointId } from "./queue.js"
+export {
+  MessageQueue,
+  RateLimiter,
+  createProcessMessageQueue,
+  createSessionMessageQueue,
+  stableSessionEndpointId,
+  stableSpoolEndpointId,
+} from "./queue.js"
 export { SessionTracker } from "./session-tracker.js"
-export { Delivery, formatMessages } from "./delivery.js"
-export { Sender, buildMessage } from "./sender.js"
+export { SessionRuntime } from "./session-runtime.js"
+export { Delivery, deterministicPeerMessageId, formatMessages } from "./delivery.js"
+export { Sender, buildMessage, buildMessageV2 } from "./sender.js"
 export { InboxListener } from "./listener.js"
+export { LocalTransport } from "./transport.js"
+export type {
+  LocalTransportOptions,
+  Transport,
+  TransportResponse,
+  TransportTarget,
+} from "./transport.js"
 export { gateMessage } from "./gating.js"
 export { PeerPermissions } from "./permissions.js"
 export { formatSessionList, relativeAge } from "./format.js"

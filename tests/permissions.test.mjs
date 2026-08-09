@@ -70,6 +70,40 @@ test("peer-triggered turn gets an automatic 'once' reply", async () => {
   assert.deepEqual(calls.map((c) => c.path.messageID), ["asst_1", "user_1"])
 })
 
+test("structured peer-message provenance follows the source message parent chain", async () => {
+  const calls = []
+  const replies = []
+  const messages = {
+    asst_1: { role: "assistant", parentID: "user_1", parts: [] },
+    user_1: {
+      role: "user",
+      parts: [{
+        type: "text",
+        text: "peer input",
+        metadata: {
+          peerMessage: {
+            version: 2,
+            messageId: "peer-1",
+            fromEndpointId: "session-alpha",
+            toSessionId: "ses_1",
+          },
+        },
+      }],
+    },
+  }
+  const inst = PeerPermissions({
+    client: makeClient({ messages, calls, replies }),
+    mode: () => "allow",
+    directory: "/tmp/x",
+    logger: noopLogger,
+  })
+
+  await inst.handleEvent(askedEvent())
+  assert.equal(replies.length, 1)
+  assert.equal(replies[0].body.response, "once")
+  assert.deepEqual(calls.map((call) => call.path.messageID), ["asst_1", "user_1"])
+})
+
 test("deny mode auto-rejects peer-turn permissions", async () => {
   const { inst, replies } = make({ mode: () => "deny" })
   await inst.handleEvent(askedEvent())

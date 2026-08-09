@@ -30,6 +30,47 @@ export interface PeerEntry {
   pluginVersion: string
 }
 
+export type SessionEndpointStatus = "idle" | "busy" | "retry"
+
+export interface PeerRegistryV2 {
+  version: 2
+  endpointId: string
+  processId: string
+  pid: number
+  sessionId: string
+  parentSessionId?: string
+  title: string
+  name: string
+  hostname: string
+  directory: string
+  status: SessionEndpointStatus
+  transport: LocalTransportAddress
+  serverUrl: string
+  inboxUrl: string
+  inboxToken: string
+  capabilities: string[]
+  timestamps: {
+    startedAt: number
+    updatedAt: number
+    heartbeatAt: number
+  }
+  policy: {
+    inboundPolicy: InboundPolicy
+    peerPermissions: PeerPermissionMode
+  }
+  pluginVersion: string
+  /** Compatibility aliases retained for existing formatters and commands. */
+  activeSessionId: string
+  activeSessionTitle: string
+  busy: boolean
+  queuedCount: number
+  inboundPolicy: InboundPolicy
+  startedAt: number
+  heartbeatAt: number
+}
+
+export type PeerRegistryEntry = PeerEntry | PeerRegistryV2
+
 /** Protocol-v1 input accepted from existing peers. */
 export interface InboundMessageV1 {
   id: string
@@ -65,6 +106,10 @@ export interface PeerAcknowledgementV2 {
   status: AcknowledgementStatus
   acknowledgedAt: number
 }
+
+export type LocalTransportAddress =
+  | { type: "unix"; path: string }
+  | { type: "tcp"; host: "127.0.0.1"; port: number }
 
 export interface HeldMessage extends InboundMessage {
   heldAt: number

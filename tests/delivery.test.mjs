@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { Delivery, formatMessages } from "../dist/delivery.js"
+import { Delivery, deterministicPeerMessageId, formatMessages } from "../dist/delivery.js"
 import { MessageQueue } from "../dist/queue.js"
 import { SessionTracker } from "../dist/session-tracker.js"
 
@@ -114,21 +114,76 @@ test("notice injects a display-only message only when idle", async () => {
   }
 })
 
-test("flush merges multiple messages into one prompt", async () => {
+test("flush injects one prompt per peer message immediately while the exact session is busy", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peers-delivery-"))
   try {
     const calls = []
     const tracker = SessionTracker()
     tracker.noteUserActivity("ses_1")
-    tracker.noteIdle("ses_1")
     const queue = await makeQueue(dir)
     queue.enqueue(msg("1"))
     queue.enqueue(msg("2", "gamma"))
-    const d = Delivery({ client: makeClient(calls), tracker, queue, directory: "/tmp/a", logger: noopLogger })
+    const d = Delivery({ client: makeClient(calls), tracker, queue, directory: "/tmp/a", logger: noopLogger, immediate: true })
     assert.equal(await d.flush(), true)
-    assert.equal(calls.length, 1)
-    assert.match(calls[0].body.parts[0].text, /hello 1[\s\S]*hello 2/)
-    assert.match(calls[0].body.parts[0].text, /"gamma"/)
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0].path.id, "ses_1")
+    assert.match(calls[0].body.parts[0].text, /hello 1/)
+    assert.doesNotMatch(calls[0].body.parts[0].text, /hello 2/)
+    assert.match(calls[1].body.parts[0].text, /hello 2/)
+    assert.equal(calls[0].body.messageID, deterministicPeerMessageId("ses_1", msg("1")))
+    assert.equal(calls[1].body.messageID, deterministicPeerMessageId("ses_1", msg("2", "gamma")))
+    assert.deepEqual(calls[0].body.parts[0].metadata.peerMessage, {
+      version: 2,
+      messageId: "1",
+      fromEndpointId: "aaaa1111",
+      toSessionId: "ses_1",
+    })
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("deterministic peer message IDs use the OpenCode msg token shape", () => {
+  const first = deterministicPeerMessageId("ses_1", msg("shape"))
+  const second = deterministicPeerMessageId("ses_1", msg("shape"))
+  assert.equal(first, second)
+  assert.match(first, /^msg_[a-f0-9]{26}$/)
+})
+
+test("an immediate message arriving during promptAsync is injected without waiting for a sweep", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-delivery-"))
+  try {
+    const calls = []
+    let releaseFirst
+    let firstStartedResolve
+    const firstStarted = new Promise((resolve) => { firstStartedResolve = resolve })
+    const client = {
+      session: {
+        promptAsync: async (args) => {
+          calls.push(args)
+          if (calls.length === 1) {
+            firstStartedResolve()
+            await new Promise((resolve) => { releaseFirst = resolve })
+          }
+        },
+      },
+    }
+    const tracker = SessionTracker()
+    tracker.noteUserActivity("ses_1")
+    const queue = await makeQueue(dir)
+    const delivery = Delivery({ client, tracker, queue, directory: "/tmp/a", logger: noopLogger, immediate: true })
+
+    queue.enqueue(msg("first"))
+    const first = delivery.flush()
+    await firstStarted
+    queue.enqueue(msg("second"))
+    const second = delivery.flush()
+    releaseFirst()
+
+    assert.equal(await first, true)
+    assert.equal(await second, true)
+    assert.deepEqual(calls.map((call) => call.body.parts[0].metadata.peerMessage.messageId), ["first", "second"])
+    assert.equal(queue.size(), 0)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
