@@ -102,7 +102,9 @@ test("competing processes serialize maxQueue admission", async () => {
   }
 })
 
-test("stale cleanup preserves a fresh owner and waits for its release", async () => {
+test("stale cleanup preserves a fresh owner and waits for its release", {
+  skip: process.platform === "win32" ? "requires POSIX SIGSTOP/SIGCONT process control" : false,
+}, async () => {
   const dir = await mkdtemp(join(tmpdir(), "peers-queue-stale-race-"))
   let holder
   let contender
