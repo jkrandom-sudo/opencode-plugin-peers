@@ -15,10 +15,11 @@ import type { TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
  *     focused prompt's text. When it is exactly one of our slash commands
  *     (no arguments), the handler executes it via `client.session.command`
  *     — the same `command.execute.before` interception as a normal submit —
- *     and reports the key handled. For any other text it returns `false`,
- *     and the keymap falls through to the normal bindings
- *     (autocomplete select / input submit), so every other keypress behaves
- *     exactly as stock.
+ *     and reports the key handled. On the home route (no session yet) it
+ *     first creates a session and navigates to it, replicating the stock
+ *     home-submit flow. For any other text it returns `false`, and the
+ *     keymap falls through to the normal bindings (autocomplete select /
+ *     input submit), so every other keypress behaves exactly as stock.
  *
  * Commands typed WITH arguments (e.g. `/peers-name foo`) never match the
  * exact-text check, so they submit normally with the argument intact.
@@ -100,15 +101,20 @@ function resolveTyped(text: string): string | null {
 
 async function runCommand(api: TuiPluginApi, command: string): Promise<void> {
   const route = api.route.current
-  const sessionID =
+  let sessionID =
     route.name === "session"
       ? (route.params as { sessionID?: string } | undefined)?.sessionID
       : undefined
-  if (!sessionID) {
-    api.ui.toast({ variant: "info", title: "opencode-plugin-peers", message: `/${command}: open a session first` })
-    return
-  }
   try {
+    if (!sessionID) {
+      // Home route: replicate the stock submit flow — create a session,
+      // switch to it, then run the command there. Server defaults apply
+      // for agent/model; our commands are consumed before any model call.
+      const res = await api.client.session.create()
+      sessionID = (res as { data?: { id?: string } }).data?.id
+      if (!sessionID) throw new Error("session.create returned no session id")
+      api.route.navigate("session", { sessionID })
+    }
     await api.client.session.command({ sessionID, command, arguments: "" })
   } catch (err) {
     api.ui.toast({
@@ -129,7 +135,9 @@ function onEnter(api: TuiPluginApi, ctx: { focused: unknown }): boolean {
   // Never hijack Enter inside dialogs (rename prompts, palette search, …).
   if (api.ui.dialog.open) return false
   const route = api.route.current
-  if (route.name !== "session") return false
+  // Only the session prompt and the home prompt are command-entry points;
+  // plugin routes and anything else keep stock behavior.
+  if (route.name !== "session" && route.name !== "home") return false
   const focused = ctx.focused as FocusedText | null
   if (typeof focused?.plainText !== "string") return false
   if (Date.now() - otherNamesAt > 60_000) void refreshOtherNames(api)

@@ -45,7 +45,7 @@ Requires opencode >= 1.18.0.
 
 Without this everything still works — the commands just keep opencode's default "first Enter inserts `/name `, second Enter submits" behavior. Notes:
 
-- The autocomplete keeps showing a **single** `/peers*` row per command (the server-defined one). Instant execution comes from a high-priority Enter binding in the TUI entry: when the prompt holds exactly a plugin command — or a prefix that uniquely identifies it, like `/peers-nam` — Enter runs it immediately; anything else falls through to opencode's stock bindings untouched.
+- The autocomplete keeps showing a **single** `/peers*` row per command (the server-defined one). Instant execution comes from a high-priority Enter binding in the TUI entry: when the prompt holds exactly a plugin command — or a prefix that uniquely identifies it, like `/peers-nam` — Enter runs it immediately; anything else falls through to opencode's stock bindings untouched. This works both inside a session and on the start (home) screen — there a session is created first, exactly like a normal submit.
 - Commands typed **with arguments** (e.g. `/peers-name frontend`) are untouched — Enter submits normally and the argument is preserved.
 - Older opencode versions ignore the TUI entry entirely and keep the two-Enter behavior.
 

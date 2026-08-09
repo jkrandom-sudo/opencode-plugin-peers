@@ -1,7 +1,7 @@
 {
   "name": "opencode-plugin-peers",
-  "version": "0.1.6",
-  "description": "Cross-session messaging for opencode — let independent sessions discover and text each other, modeled after Claude Code's cross-session messaging",
+  "version": "0.1.7",
+  "description": "Cross-session messaging for opencode \u2014 let independent sessions discover and text each other, modeled after Claude Code's cross-session messaging",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",

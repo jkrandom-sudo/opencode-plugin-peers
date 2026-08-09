@@ -9,8 +9,12 @@ function makeApi(over = {}) {
   const toasts = []
   const disposers = []
   let unregister
+  const navigate = (name, params) => calls.push({ kind: "navigate", name, params })
   const api = {
-    route: { current: { name: "session", params: { sessionID: "ses_1" } } },
+    route: {
+      current: { name: "session", params: { sessionID: "ses_1" } },
+      navigate,
+    },
     keymap: {
       registerLayer: (layer) => {
         calls.push({ kind: "registerLayer", layer })
@@ -30,6 +34,11 @@ function makeApi(over = {}) {
         }),
       },
       session: {
+        create: async () => {
+          calls.push({ kind: "create" })
+          if (over.failCreate) throw new Error("create failed")
+          return { data: { id: "ses_created" } }
+        },
         command: async (args) => {
           calls.push({ kind: "command", args })
           if (over.failCommand) throw new Error("server unreachable")
@@ -41,7 +50,9 @@ function makeApi(over = {}) {
       dialog: { open: over.dialogOpen ?? false },
     },
     lifecycle: { onDispose: (fn) => disposers.push(fn) },
-    ...("route" in over ? { route: over.route } : {}),
+    ...("route" in over
+      ? { route: { current: over.route.current, navigate } }
+      : {}),
   }
   api.keymap.getCommandEntries = () => [
     { command: { name: "session.new", slashName: "new" } },
@@ -160,16 +171,35 @@ test("Enter binding rejects everything else so stock behavior is untouched", asy
   assert.equal(calls.filter((c) => c.kind === "command").length, 0)
 })
 
-test("Enter binding rejects inside dialogs and outside session routes", async () => {
+test("Enter on the home route creates a session, navigates, and executes", async () => {
+  const { api, calls } = makeApi({ route: { current: { name: "home" } } })
+  await mod.tui(api)
+  const binding = calls[0].layer.bindings[0]
+  const focused = makeFocused("/peers")
+  assert.equal(binding.cmd({ focused }), true)
+  assert.equal(focused.plainText, "")
+  await new Promise((r) => setImmediate(r))
+  await new Promise((r) => setImmediate(r))
+  assert.deepEqual(
+    calls.filter((c) => ["create", "navigate", "command"].includes(c.kind)),
+    [
+      { kind: "create" },
+      { kind: "navigate", name: "session", params: { sessionID: "ses_created" } },
+      { kind: "command", args: { sessionID: "ses_created", command: "peers", arguments: "" } },
+    ],
+  )
+})
+
+test("Enter binding rejects inside dialogs and on plugin routes", async () => {
   const dialogApi = makeApi({ dialogOpen: true })
   await mod.tui(dialogApi.api)
   const dialogBinding = dialogApi.calls[0].layer.bindings[0]
   assert.equal(dialogBinding.cmd({ focused: makeFocused("/peers") }), false)
 
-  const homeApi = makeApi({ route: { current: { name: "home" } } })
-  await mod.tui(homeApi.api)
-  const homeBinding = homeApi.calls[0].layer.bindings[0]
-  assert.equal(homeBinding.cmd({ focused: makeFocused("/peers") }), false)
+  const pluginApi = makeApi({ route: { current: { name: "some-plugin", params: {} } } })
+  await mod.tui(pluginApi.api)
+  const pluginBinding = pluginApi.calls[0].layer.bindings[0]
+  assert.equal(pluginBinding.cmd({ focused: makeFocused("/peers") }), false)
 })
 
 test("layer priority outranks the autocomplete select binding", async () => {
@@ -178,15 +208,31 @@ test("layer priority outranks the autocomplete select binding", async () => {
   assert.ok(calls[0].layer.priority > 1) // TUI built-ins use 0..1
 })
 
-test("run() outside a session toasts and does not call the server", async () => {
-  const { api, calls, toasts } = makeApi({ route: { current: { name: "home" } } })
+test("run() on the home route creates a session and executes there", async () => {
+  const { api, calls } = makeApi({ route: { current: { name: "home" } } })
   await mod.tui(api)
   const peers = calls[0].layer.commands.find((c) => c.name === "opencode-plugin-peers.peers")
   await peers.run()
+  assert.deepEqual(
+    calls.filter((c) => ["create", "navigate", "command"].includes(c.kind)),
+    [
+      { kind: "create" },
+      { kind: "navigate", name: "session", params: { sessionID: "ses_created" } },
+      { kind: "command", args: { sessionID: "ses_created", command: "peers", arguments: "" } },
+    ],
+  )
+})
+
+test("session.create failure surfaces an error toast and does not navigate", async () => {
+  const { api, calls, toasts } = makeApi({ route: { current: { name: "home" } }, failCreate: true })
+  await mod.tui(api)
+  const peers = calls[0].layer.commands.find((c) => c.name === "opencode-plugin-peers.peers")
+  await peers.run()
+  assert.equal(calls.filter((c) => c.kind === "navigate").length, 0)
   assert.equal(calls.filter((c) => c.kind === "command").length, 0)
   assert.equal(toasts.length, 1)
-  assert.equal(toasts[0].variant, "info")
-  assert.match(toasts[0].message, /open a session first/)
+  assert.equal(toasts[0].variant, "error")
+  assert.match(toasts[0].message, /create failed/)
 })
 
 test("server failure surfaces an error toast and does not throw", async () => {
