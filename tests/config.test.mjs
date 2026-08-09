@@ -27,6 +27,11 @@ test("resolveConfig applies defaults", () => {
   assert.equal(cfg.sweepMs, 15_000)
 })
 
+test("resolveConfig accepts the additional auto inbound policy without changing the default", () => {
+  assert.equal(resolveConfig(undefined, {}).inboundPolicy, "accept")
+  assert.equal(resolveConfig({ inboundPolicy: "auto" }, {}).inboundPolicy, "auto")
+})
+
 test("resolveConfig merges user options", () => {
   const cfg = resolveConfig(
     { inboundPolicy: "hold", name: "frontend", maxQueue: 5, storageDir: "/custom", peerPermissions: "ask" },

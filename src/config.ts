@@ -8,7 +8,7 @@ export interface ResolvedConfig {
   inboxFile: string
   spoolDir: string
   name: string | undefined
-  inboundPolicy: "accept" | "hold" | "refuse"
+  inboundPolicy: "accept" | "auto" | "hold" | "refuse"
   peerPermissions: PeerPermissionMode
   heartbeatMs: number
   staleMs: number

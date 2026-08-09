@@ -45,6 +45,29 @@ interface MessageView {
   isPeer: boolean
 }
 
+function flattenedPermissionText(props: Record<string, unknown>): string {
+  const values: string[] = []
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 3 || value == null) return
+    if (typeof value === "string") values.push(value)
+    else if (Array.isArray(value)) for (const item of value) visit(item, depth + 1)
+    else if (typeof value === "object") for (const item of Object.values(value as Record<string, unknown>)) visit(item, depth + 1)
+  }
+  visit(props, 0)
+  return values.join("\n").toLowerCase()
+}
+
+/** Requests in these categories always remain under OpenCode's native policy/UI. */
+export function isProtectedPermission(props: Record<string, unknown>): boolean {
+  const permission = String(props.permission ?? props.action ?? props.type ?? "").toLowerCase()
+  const text = flattenedPermissionText(props)
+  if (permission === "permission" || /permission[ _.-]*(?:escalat|config|rule)/.test(text)) return true
+  return /(?:^|[\\/\s])agents\.md(?:$|\s)/i.test(text) ||
+    /(?:^|[\\/\s])(?:opencode(?:\.jsonc?)?|\.opencode)(?:$|[\\/\s])/i.test(text) ||
+    /(?:^|[\\/\s])(?:\.env(?:\.[^\s\\/]*)?|credentials?|secrets?|\.npmrc|\.pypirc)(?:$|\s)/i.test(text) ||
+    /(?:^|[\\/\s])(?:\.aws|\.ssh|\.gnupg)[\\/]/i.test(text)
+}
+
 export function PeerPermissions(opts: PeerPermissionsOptions): PeerPermissionsInstance {
   // messageID -> whether that message's turn is peer-triggered. Verdicts are
   // stable per message, and one turn typically raises several permission
@@ -119,6 +142,15 @@ export function PeerPermissions(opts: PeerPermissionsOptions): PeerPermissionsIn
       if (!permissionID || !sessionID || !messageID) return
       if (replied.has(permissionID)) return
       if (!(await isPeerTurn(sessionID, messageID))) return
+
+      if (mode === "allow" && isProtectedPermission(props)) {
+        await opts.logger("warn", "protected peer permission left to OpenCode policy", {
+          permission: props.permission ?? props.action ?? props.type,
+          sessionID,
+          permissionID,
+        })
+        return
+      }
 
       replied.add(permissionID)
       if (replied.size > CACHE_CAP) {

@@ -301,12 +301,23 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
       }
       const v2Processes = new Set(entries.flatMap((entry) => entry.version === 2 ? [entry.processId] : []))
       const out: ListedPeer[] = []
+      const v2ByEndpoint = new Map<string, ListedPeer>()
       for (const entry of entries) {
         if (entry.version === 1 && v2Processes.has(entry.instanceId)) continue
         const reason = staleReason(entry, now)
-        out.push({ entry, alive: reason === null, staleReason: reason })
+        const listed = { entry, alive: reason === null, staleReason: reason }
+        if (entry.version !== 2) {
+          out.push(listed)
+          continue
+        }
+        const current = v2ByEndpoint.get(entry.endpointId)
+        const currentHeartbeat = current?.entry.heartbeatAt ?? -Infinity
+        if (!current || (listed.alive && !current.alive) ||
+          (listed.alive === current.alive && entry.heartbeatAt > currentHeartbeat)) {
+          v2ByEndpoint.set(entry.endpointId, listed)
+        }
       }
-      return out
+      return [...out, ...v2ByEndpoint.values()]
     },
 
     isAlive(entry) {

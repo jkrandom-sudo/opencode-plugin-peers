@@ -8,7 +8,7 @@ import type { TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
  * waits for a second Enter. To get single-Enter execution WITHOUT a duplicate
  * autocomplete row, this module does two things:
  *
- *  1. Registers the four commands as palette commands (no `slashName`, so
+ *  1. Registers the five commands as palette commands (no `slashName`, so
  *     they do NOT add rows to the autocomplete — the menu keeps only the
  *     server-defined row).
  *  2. Registers a high-priority "return" binding whose handler checks the
@@ -35,6 +35,7 @@ const COMMANDS = [
   { cmd: "list-agents", title: "List agents", desc: "Alias of /peers" },
   { cmd: "peers-name", title: "Show/set peer name", desc: "Show or set this instance's peer name" },
   { cmd: "peers-inbox", title: "Peer inbox", desc: "Review held peer messages" },
+  { cmd: "peers-outbox", title: "Peer outbox", desc: "Review peer delivery acknowledgements" },
 ] as const
 
 const EXACT = new Set<string>(COMMANDS.map(({ cmd }) => `/${cmd}`))
@@ -99,7 +100,7 @@ function resolveTyped(text: string): string | null {
   return ours[0].cmd
 }
 
-async function runCommand(api: TuiPluginApi, command: string): Promise<void> {
+async function runCommand(api: TuiPluginApi, command: string, commandArguments = ""): Promise<void> {
   const route = api.route.current
   let sessionID =
     route.name === "session"
@@ -115,7 +116,7 @@ async function runCommand(api: TuiPluginApi, command: string): Promise<void> {
       if (!sessionID) throw new Error("session.create returned no session id")
       api.route.navigate("session", { sessionID })
     }
-    await api.client.session.command({ sessionID, command, arguments: "" })
+    await api.client.session.command({ sessionID, command, arguments: commandArguments })
   } catch (err) {
     api.ui.toast({
       variant: "error",
@@ -123,6 +124,44 @@ async function runCommand(api: TuiPluginApi, command: string): Promise<void> {
       message: err instanceof Error ? err.message : String(err),
     })
   }
+}
+
+type DialogApi = {
+  DialogSelect: (props: { title: string; options: Array<{ title: string; value: string; description?: string }> }) => Promise<string | null | undefined>
+  DialogPrompt: (props: { title: string; placeholder?: string; value?: string }) => Promise<string | null | undefined>
+  DialogConfirm: (props: { title: string; message: string }) => Promise<boolean>
+}
+
+async function runControl(api: TuiPluginApi, command: string): Promise<void> {
+  const dialogs = api.ui as unknown as DialogApi
+  if (command === "peers-name") {
+    const name = (await dialogs.DialogPrompt({ title: "Rename this peer", placeholder: "1-32 safe characters" }))?.trim()
+    if (!name) return
+    if (!(await dialogs.DialogConfirm({ title: "Confirm peer rename", message: `Rename this peer to "${name}"?` }))) return
+    return runCommand(api, command, name)
+  }
+  if (command === "peers-inbox") {
+    const action = await dialogs.DialogSelect({
+      title: "Peer inbox action",
+      options: [
+        { title: "List held messages", value: "list" },
+        { title: "Accept held message", value: "accept" },
+        { title: "Drop held message", value: "drop" },
+      ],
+    })
+    if (!action) return
+    if (action === "list") return runCommand(api, command)
+    const target = (await dialogs.DialogPrompt({ title: `${action === "accept" ? "Accept" : "Drop"} which message?`, placeholder: "number or all" }))?.trim()
+    if (!target || (!/^\d+$/.test(target) && target !== "all")) return
+    if (action === "drop" && !(await dialogs.DialogConfirm({ title: "Confirm message drop", message: `Permanently drop held message ${target}?` }))) return
+    return runCommand(api, command, `${action} ${target}`)
+  }
+  const selected = await dialogs.DialogSelect({
+    title: command === "peers-outbox" ? "Peer outbox" : "Peer sessions",
+    options: [{ title: command === "peers-outbox" ? "View delivery status" : "List peer sessions", value: "list" }],
+  })
+  if (selected !== "list") return
+  return runCommand(api, command)
 }
 
 /**
@@ -172,7 +211,7 @@ const mod: TuiPluginModule = {
         // duplicate row to the autocomplete menu. Instant execution comes
         // from the Enter binding below; these stay reachable via the
         // command palette.
-        run: () => runCommand(api, cmd),
+        run: () => runControl(api, cmd),
       })),
       bindings: [{ key: "return", cmd: (ctx: { focused: unknown }) => onEnter(api, ctx) }],
     })

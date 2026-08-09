@@ -10,6 +10,7 @@ import { formatSessionList } from "./format.js"
 import type { RegistryInstance } from "./registry.js"
 import type { QueueInstance } from "./queue.js"
 import type { DeliveryInstance } from "./delivery.js"
+import type { OutboxInstance } from "./outbox.js"
 
 export interface CommandContext {
   registry: RegistryInstance
@@ -20,6 +21,7 @@ export interface CommandContext {
   selfInstanceId: string
   /** Exact endpoint for the session that invoked this command. */
   selfEndpointId?: string
+  outbox?: Pick<OutboxInstance, "list">
 }
 
 export interface CommandResult {
@@ -69,10 +71,23 @@ export async function handlePeersCommand(
     return handleInbox(ctx, args.trim())
   }
 
+  if (command === "peers-outbox") {
+    const endpointId = ctx.selfEndpointId ?? ctx.selfInstanceId
+    const records = ctx.outbox?.list(endpointId) ?? []
+    if (records.length === 0) return { handled: true, message: "📭 Peer outbox is empty." }
+    const lines = records.map((record) => {
+      const receipt = record.receiptStatus ? `receipt: ${record.receiptStatus}` : "no receipt"
+      const final = record.finalStatus ? `final: ${record.finalStatus}` : "awaiting final ACK"
+      return `- ${record.messageId} → "${record.toName}" — ${receipt}; ${final}${record.error ? `; ${record.error}` : ""}`
+    })
+    return { handled: true, message: `📤 ${records.length} outbound message(s):\n${lines.join("\n")}` }
+  }
+
   return { handled: false }
 }
 
 async function handleInbox(ctx: CommandContext, args: string): Promise<CommandResult> {
+  await ctx.queue.expireHeld()
   const [action, n] = args.split(/\s+/, 2)
 
   if (!action) {
@@ -80,7 +95,7 @@ async function handleInbox(ctx: CommandContext, args: string): Promise<CommandRe
     if (held.length === 0) return { handled: true, message: "📭 Held inbox is empty." }
     const lines = held.map((m, i) => {
       const preview = m.text.length > 80 ? `${m.text.slice(0, 80)}…` : m.text
-      return `${i + 1}. from "${m.from.name}" — ${preview}`
+      return `${i + 1}. from "${m.from.name}" — ${preview} — expires ${new Date(m.expiresAt).toISOString()}`
     })
     return {
       handled: true,

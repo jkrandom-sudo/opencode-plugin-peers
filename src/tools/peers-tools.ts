@@ -9,6 +9,7 @@ import { z } from "zod"
 import type { ListedPeer, RegistryInstance } from "../registry.js"
 import type { Sender } from "../sender.js"
 import type { RateLimiter } from "../queue.js"
+import type { OutboxInstance } from "../outbox.js"
 
 export interface ToolsDeps {
   registry: RegistryInstance
@@ -18,6 +19,7 @@ export interface ToolsDeps {
   selfName: () => string
   selfInstanceId: string
   endpointForSession?: (sessionId: string) => { endpointId: string; name: string; directory: string } | null
+  outbox?: Pick<OutboxInstance, "get" | "list">
 }
 
 function entryId(entry: ListedPeer["entry"]): string {
@@ -59,6 +61,22 @@ export function formatPeerList(peers: ListedPeer[], selfName: string, selfId: st
 
 export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> {
   return {
+    peer_message_status: tool({
+      description: "Query the durable receipt and final ACK status of a peer message sent by this session.",
+      args: {
+        message_id: z.string().describe("Message ID returned by send_message"),
+      },
+      async execute(args, context) {
+        const self = deps.endpointForSession?.(context.sessionID)
+        if (!self) return `Error: sender session "${context.sessionID}" is not registered.`
+        const record = deps.outbox?.get(self.endpointId, args.message_id)
+        if (!record) return `Peer message "${args.message_id}" was not found in this session's outbox.`
+        const receipt = record.receiptStatus ? `receipt: ${record.receiptStatus}` : "no transport receipt"
+        const final = record.finalStatus ? `final: ${record.finalStatus}` : "awaiting final ACK"
+        return `Message ${record.messageId} to "${record.toName}" — ${receipt}; ${final}${record.error ? `; error: ${record.error}` : ""}.`
+      },
+    }),
+
     list_agents: tool({
       description:
         "List other opencode session endpoints on this machine that you can exchange plain-text messages with. Shows each endpoint's name, id, directory, session and inbound policy.",
@@ -144,15 +162,16 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
           directory: self.directory,
         } : undefined)
         if (!result.ok) return `Error: ${result.error}`
+        const tracking = result.messageId ? ` Tracking ID: ${result.messageId}.` : ""
         switch (result.status) {
           case "delivered":
-            return `Message delivered to "${peer.name}".`
+            return `Message delivered to "${peer.name}".${tracking}`
           case "duplicate":
             return `Message was already received by "${peer.name}".`
           case "queued":
-            return `Message queued for "${peer.name}" (their session is busy; it will be delivered when idle).`
+            return `Message queued for "${peer.name}" (their session is busy); awaiting final delivery ACK.${tracking}`
           case "held":
-            return `"${peer.name}" reviews inbound messages manually; your message awaits their approval.`
+            return `"${peer.name}" reviews inbound messages manually; your message awaits their approval.${tracking}`
           case "refused":
             return `Error: "${peer.name}" refuses inbound messages.`
           case "full":

@@ -30,14 +30,16 @@ import type { QueueInstance } from "./queue.js"
 import { SessionRuntime } from "./session-runtime.js"
 import type { DeliveryInstance } from "./delivery.js"
 import { Sender } from "./sender.js"
+import { LocalTransport } from "./transport.js"
+import { Outbox } from "./outbox.js"
 import { PeerPermissions } from "./permissions.js"
 import { buildPeerTools } from "./tools/peers-tools.js"
 import { handlePeersCommand } from "./commands.js"
 import { consumeCommand, createLogger, errorMessage } from "./feedback.js"
 import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 
-const PLUGIN_VERSION = "0.1.7"
-const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox"])
+const PLUGIN_VERSION = "0.2.0"
+const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox", "peers-outbox"])
 
 export async function runReliabilitySweep(
   queue: QueueInstance,
@@ -68,10 +70,11 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     name: () => currentName,
     logger,
   })
-  await runtime.initialize()
 
   const recvLimit = RateLimiter(config.recvRatePerMin)
   const sendLimit = RateLimiter(config.sendRatePerMin)
+  const outbox = Outbox({ storageDir: config.storageDir })
+  let dispatchAcknowledgements: () => Promise<void> = async () => {}
 
   const listener = InboxListener({
     token: inboxToken,
@@ -86,7 +89,18 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     logger,
     onMessage: async (msg, endpointId): Promise<ReceiveStatus> => {
       if (!recvLimit(msg.from.instanceId)) return "full"
-      return runtime.receive(msg, endpointId!, policy)
+      const status = await runtime.receive(msg, endpointId!, policy)
+      void dispatchAcknowledgements()
+      return status
+    },
+    onAcknowledgement: async (acknowledgement) => {
+      if (!(await outbox.applyAcknowledgement(acknowledgement))) {
+        await logger("warn", "ignored unmatched peer acknowledgement", {
+          messageId: acknowledgement.messageId,
+          fromEndpointId: acknowledgement.fromEndpointId,
+          toEndpointId: acknowledgement.toEndpointId,
+        })
+      }
     },
   })
 
@@ -128,6 +142,28 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
 
   await registry.start()
 
+  const acknowledgementTransport = LocalTransport()
+  dispatchAcknowledgements = async (): Promise<void> => {
+    const pending = runtime.pendingAcknowledgements()
+    if (pending.length === 0) return
+    const peers = await registry.list()
+    for (const { queue, acknowledgement } of pending) {
+      const target = peers.find((peer) => peer.alive && peer.entry.version === 2 &&
+        peer.entry.endpointId === acknowledgement.fromEndpointId)?.entry
+      if (!target || target.version !== 2) continue
+      try {
+        await acknowledgementTransport.ack(target, acknowledgement)
+        await queue.markAcknowledgementSent(acknowledgement)
+      } catch (err) {
+        await logger("warn", "failed to return peer acknowledgement; will retry", {
+          error: String(err),
+          messageId: acknowledgement.messageId,
+          senderEndpointId: acknowledgement.fromEndpointId,
+        })
+      }
+    }
+  }
+
   const sender = Sender({
     self: {
       get instanceId() {
@@ -138,12 +174,14 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
       },
       directory: ctx.directory,
     },
+    outbox,
   })
 
   const sweepReliability = async (): Promise<void> => {
     if (disposing) return
     try {
       await runtime.sweep()
+      await dispatchAcknowledgements()
     } catch (err) {
       await logger("error", "reliability sweep failed", { error: errorMessage(err) })
     }
@@ -157,6 +195,7 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   })
   let disposing = false
   let disposePromise: Promise<void> | null = null
+  let discoveryTimer: ReturnType<typeof setTimeout> | null = null
 
   // Fallback sweep: session.idle is not guaranteed on every version/scenario,
   // so poll idle state periodically as a safety net.
@@ -203,11 +242,13 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
             },
             selfInstanceId: instanceId,
             selfEndpointId: runtime.endpointIdForSession(input.sessionID) ?? instanceId,
+            outbox,
           },
           input.command,
           input.arguments || ""
         )
         message = result.message ?? "✅ Done."
+        await dispatchAcknowledgements()
       } catch (err) {
         message = `❌ /${input.command} failed: ${errorMessage(err)}`
       }
@@ -232,11 +273,14 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
         ? { endpointId, name: endpoint.name, directory: endpoint.directory }
         : null
     },
+    outbox,
   })
 
   hooks.dispose = () => {
     if (disposePromise) return disposePromise
     disposing = true
+    if (discoveryTimer) clearTimeout(discoveryTimer)
+    discoveryTimer = null
     clearInterval(sweeper)
     const registryStopping = registry.stop()
     const runtimeStopping = runtime.stop()
@@ -244,6 +288,7 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
       registryStopping,
       runtimeStopping,
       listener.stop(),
+      acknowledgementTransport.close(),
     ]).then(() => undefined)
     return disposePromise
   }
@@ -255,6 +300,20 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     transportUrl,
     policy,
   })
+
+  // OpenCode constructs plugins while servicing the first session request.
+  // Calling this server's session API before returning hooks deadlocks that
+  // request, so discover pre-existing sessions only after bootstrap unwinds.
+  discoveryTimer = setTimeout(() => {
+    discoveryTimer = null
+    if (disposing) return
+    void runtime.initialize()
+      .then(async () => {
+        if (!disposing) await registry.heartbeat()
+      })
+      .catch((err) => logger("warn", "deferred session discovery failed", { error: String(err) }))
+  }, 0)
+  discoveryTimer.unref?.()
 
   return hooks
 }
@@ -290,7 +349,8 @@ export type {
   TransportTarget,
 } from "./transport.js"
 export { gateMessage } from "./gating.js"
-export { PeerPermissions } from "./permissions.js"
+export { PeerPermissions, isProtectedPermission } from "./permissions.js"
+export { Outbox } from "./outbox.js"
 export { formatSessionList, relativeAge } from "./format.js"
 export { resolveConfig, validateName } from "./config.js"
 export * from "./types.js"

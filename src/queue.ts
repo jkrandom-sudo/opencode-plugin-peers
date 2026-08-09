@@ -37,6 +37,7 @@ interface SpoolRecord {
   heldAt?: number
   expiresAt?: number
   ack?: PeerAcknowledgementV2
+  ackSentAt?: number
   duplicateOfMessageId?: string
 }
 
@@ -115,6 +116,10 @@ export interface QueueInstance {
   held: () => HeldMessage[]
   /** Move expired held records to done and return their final acknowledgements. */
   expireHeld: () => Promise<PeerAcknowledgementV2[]>
+  /** Final outcomes that still need to be returned to their sender. */
+  pendingAcknowledgements: () => PeerAcknowledgementV2[]
+  /** Durably record successful ACK transport so restarts do not resend forever. */
+  markAcknowledgementSent: (ack: PeerAcknowledgementV2) => Promise<void>
   /** Accept by 1-based index or "all"; returns the messages moved to the queue. */
   acceptHeld: (which: number | "all") => Promise<HeldMessage[]>
   dropHeld: (which: number | "all") => Promise<number>
@@ -828,6 +833,24 @@ export function MessageQueue(opts: QueueOptions): QueueInstance {
     },
 
     expireHeld: expireHeldRecords,
+
+    pendingAcknowledgements() {
+      return withEndpointLock(() => stateRecords("done")
+        .filter((record) => record.ack && !record.ackSentAt)
+        .map((record) => record.ack!))
+    },
+
+    async markAcknowledgementSent(ack) {
+      withEndpointLock(() => {
+        const record = stateRecords("done").find((candidate) =>
+          candidate.ack?.messageId === ack.messageId &&
+          candidate.ack.fromEndpointId === ack.fromEndpointId &&
+          candidate.ack.toEndpointId === ack.toEndpointId
+        )
+        if (!record) return
+        persistRecord(doneFile(record.message), { ...record, ackSentAt: Date.now() })
+      })
+    },
 
     async acceptHeld(which) {
       return withEndpointLock(() => {

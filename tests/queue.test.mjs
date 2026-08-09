@@ -20,6 +20,8 @@ test("gateMessage maps policies", () => {
   assert.equal(gateMessage("accept", msg("1")), "queue")
   assert.equal(gateMessage("hold", msg("1")), "hold")
   assert.equal(gateMessage("refuse", msg("1")), "refuse")
+  assert.equal(gateMessage("auto", msg("1"), "/tmp/a"), "hold")
+  assert.equal(gateMessage("auto", { ...msg("1"), from: { ...msg("1").from, directory: "/tmp/a" } }, "/tmp/a"), "queue")
 })
 
 test("isLoopMessage flags long via chains", () => {
@@ -242,6 +244,24 @@ test("queue: completing inflight messages stores a delivered acknowledgement", a
     assert.equal(ack.status, "delivered")
     assert.equal((await readdir(join(dir, "spool", "endpoint-a", "inflight"))).length, 0)
     assert.equal((await readdir(join(dir, "spool", "endpoint-a", "done"))).length, 1)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("queue: final acknowledgements remain pending across restart until marked sent", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-q-"))
+  try {
+    const opts = { endpointId: "receiver", maxQueue: 2, maxHeld: 2, inboxFile: join(dir, "inbox.json"), logger: noopLogger }
+    const first = MessageQueue(opts)
+    first.enqueue(msg("ack-retry"))
+    const [inflight] = first.drain()
+    await first.complete([inflight])
+    assert.deepEqual(first.pendingAcknowledgements().map((ack) => ack.status), ["delivered"])
+    const restarted = MessageQueue(opts)
+    assert.equal(restarted.pendingAcknowledgements().length, 1)
+    await restarted.markAcknowledgementSent(restarted.pendingAcknowledgements()[0])
+    assert.equal(MessageQueue(opts).pendingAcknowledgements().length, 0)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

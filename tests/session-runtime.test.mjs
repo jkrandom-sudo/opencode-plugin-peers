@@ -125,6 +125,12 @@ test("plugin exposes same-process sessions and uses tool context sessionID as se
       sweepMs: 60_000,
     })
 
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const files = await readdir(join(storageDir, "peers.d"))
+      if (files.filter((file) => file.endsWith(".v2.json")).length === 3) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+
     const registryFiles = await readdir(join(storageDir, "peers.d"))
     const entries = await Promise.all(registryFiles.map(async (file) =>
       JSON.parse(await readFile(join(storageDir, "peers.d", file), "utf8"))))
@@ -153,6 +159,34 @@ test("plugin exposes same-process sessions and uses tool context sessionID as se
     const injected = client.prompts.at(-1)
     assert.equal(injected.path.id, "ses_two")
     assert.equal(injected.body.parts[0].metadata.peerMessage.fromEndpointId, senderId)
+  } finally {
+    await hooks?.dispose?.()
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})
+
+test("plugin returns hooks before deferred session discovery completes", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peers-plugin-bootstrap-"))
+  let hooks
+  try {
+    const client = fakeClient()
+    client.app = { log: async () => ({ data: true }) }
+    let releaseList
+    client.session.list = () => new Promise((resolve) => { releaseList = () => resolve({ data: [] }) })
+    const pending = PeersPlugin({
+      client,
+      directory: "/workspace/project",
+      worktree: "/workspace/project",
+      project: { id: "project-1" },
+      serverUrl: new URL("http://127.0.0.1:4096"),
+    }, { storageDir, heartbeatMs: 60_000, sweepMs: 60_000 })
+    const first = await Promise.race([
+      pending.then(() => "returned"),
+      new Promise((resolve) => setTimeout(() => resolve("blocked"), 50)),
+    ])
+    releaseList?.()
+    hooks = await pending
+    assert.equal(first, "returned")
   } finally {
     await hooks?.dispose?.()
     await rm(storageDir, { recursive: true, force: true })

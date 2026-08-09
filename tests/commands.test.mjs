@@ -38,6 +38,7 @@ async function makeCtx(dir) {
     selfInstanceId: "self1234",
     _dyn: dyn,
     _flushes: flushes,
+    outbox: { list: () => [] },
   }
   return ctx
 }
@@ -48,6 +49,38 @@ const msg = (id) => ({
   text: `held text ${id}`,
   via: ["bbbb2222"],
   sentAt: Date.now(),
+})
+
+test("/peers-outbox distinguishes receipt from final delivery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
+  try {
+    const ctx = await makeCtx(dir)
+    ctx.selfEndpointId = "session-alpha"
+    ctx.outbox.list = () => [{
+      messageId: "m1", toName: "beta", toEndpointId: "session-beta", text: "hello",
+      createdAt: Date.now(), updatedAt: Date.now(), receiptStatus: "held",
+    }]
+    const result = await handlePeersCommand(ctx, "peers-outbox", "")
+    assert.match(result.message, /m1/)
+    assert.match(result.message, /receipt: held/)
+    assert.match(result.message, /awaiting final ACK/)
+    await ctx.registry.stop()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("/peers-inbox lists expiry timestamps", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
+  try {
+    const ctx = await makeCtx(dir)
+    await ctx.queue.hold(msg("expiry"))
+    const result = await handlePeersCommand(ctx, "peers-inbox", "")
+    assert.match(result.message, /expires/i)
+    await ctx.registry.stop()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test("/peers shows an empty Claude-Code-style session list", async () => {

@@ -1,4 +1,4 @@
-export type InboundPolicy = "accept" | "hold" | "refuse"
+export type InboundPolicy = "accept" | "auto" | "hold" | "refuse"
 
 export type PeerPermissionMode = "allow" | "ask" | "deny"
 
@@ -105,6 +105,21 @@ export interface PeerAcknowledgementV2 {
   toEndpointId: string
   status: AcknowledgementStatus
   acknowledgedAt: number
+}
+
+export interface OutboxRecord {
+  version: 1
+  messageId: string
+  fromEndpointId: string
+  toEndpointId: string
+  toName: string
+  text: string
+  createdAt: number
+  updatedAt: number
+  receiptStatus?: ReceiveStatus
+  finalStatus?: AcknowledgementStatus
+  acknowledgedAt?: number
+  error?: string
 }
 
 export type LocalTransportAddress =

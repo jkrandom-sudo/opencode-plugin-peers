@@ -258,6 +258,33 @@ test("registry dual-reads a legacy v1 process beside v2 session endpoints", asyn
   }
 })
 
+test("registry deduplicates a restarted v2 endpoint in favor of the live newest process", async () => {
+  const dir = await makeDir()
+  try {
+    const reg = makeRegistry(dir, dyn)
+    await reg.start()
+    const now = Date.now()
+    const base = {
+      version: 2, endpointId: "session-restarted", sessionId: "ses_same", title: "same", name: "project",
+      hostname: "localhost", directory: "/tmp/proj", status: "idle", transport: { type: "tcp", host: "127.0.0.1", port: 1 },
+      serverUrl: "", inboxUrl: "http://127.0.0.1:1", inboxToken: "token", capabilities: ["ack"],
+      timestamps: { startedAt: now - 1000, updatedAt: now, heartbeatAt: now },
+      policy: { inboundPolicy: "accept", peerPermissions: "allow" }, pluginVersion: "0.2.0",
+      activeSessionId: "ses_same", activeSessionTitle: "same", busy: false, queuedCount: 0,
+      inboundPolicy: "accept", startedAt: now - 1000, heartbeatAt: now,
+    }
+    await writeFile(join(dir, "old.v2.json"), JSON.stringify({ ...base, processId: "old", pid: 2 ** 22 + 123 }))
+    await writeFile(join(dir, "new.v2.json"), JSON.stringify({ ...base, processId: "new", pid: process.pid, heartbeatAt: now + 1, timestamps: { ...base.timestamps, heartbeatAt: now + 1 } }))
+    const peers = (await reg.list()).filter((peer) => peer.entry.version === 2 && peer.entry.endpointId === "session-restarted")
+    assert.equal(peers.length, 1)
+    assert.equal(peers[0].alive, true)
+    assert.equal(peers[0].entry.processId, "new")
+    await reg.stop()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("concurrent v2 heartbeats publish complete registry files", async () => {
   const dir = await makeDir()
   try {

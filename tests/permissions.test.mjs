@@ -180,3 +180,24 @@ test("turn verdicts are cached per originating messageID", async () => {
   // asst_1 turn resolved once (2 fetches); per_2 hit the cache
   assert.equal(calls.length, 2)
 })
+
+for (const [label, properties] of [
+  ["OpenCode permission configuration", { permission: "edit", patterns: ["opencode.json"] }],
+  ["plugin permission configuration", { permission: "write", patterns: [".opencode/plugins/peers.json"] }],
+  ["AGENTS.md", { permission: "edit", patterns: ["AGENTS.md"] }],
+  ["credentials", { permission: "read", patterns: ["~/.aws/credentials"] }],
+  ["secrets", { permission: "read", patterns: [".env.production"] }],
+  ["permission escalation", { permission: "permission", patterns: ["bash:*"], metadata: { escalation: true } }],
+]) {
+  test(`allow mode never auto-approves ${label}`, async () => {
+    const { inst, replies } = make()
+    await inst.handleEvent(askedEvent(properties))
+    assert.equal(replies.length, 0)
+  })
+}
+
+test("deny mode still rejects a protected peer permission", async () => {
+  const { inst, replies } = make({ mode: () => "deny" })
+  await inst.handleEvent(askedEvent({ permission: "edit", patterns: ["AGENTS.md"] }))
+  assert.equal(replies[0].body.response, "reject")
+})

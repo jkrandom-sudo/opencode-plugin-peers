@@ -51,6 +51,20 @@ function makeTools({ listed = [], sendResult = { ok: true, status: "delivered" }
   return { tools, sender }
 }
 
+test("peer_message_status returns durable final and pending states for the invoking session", async () => {
+  const records = [
+    { messageId: "done-1", toName: "beta", toEndpointId: "session-beta", receiptStatus: "held", finalStatus: "delivered", createdAt: 1 },
+    { messageId: "wait-1", toName: "gamma", toEndpointId: "session-gamma", receiptStatus: "held", createdAt: 2 },
+  ]
+  const { tools } = makeTools({ over: {
+    endpointForSession: () => ({ endpointId: "session-alpha", name: "alpha", directory: "/tmp/a" }),
+    outbox: { get: (_endpoint, id) => records.find((r) => r.messageId === id) ?? null, list: () => records },
+  } })
+  assert.match(await tools.peer_message_status.execute({ message_id: "done-1" }, { sessionID: "ses-a" }), /final: delivered/)
+  assert.match(await tools.peer_message_status.execute({ message_id: "wait-1" }, { sessionID: "ses-a" }), /awaiting final ACK/)
+  assert.match(await tools.peer_message_status.execute({ message_id: "missing" }, { sessionID: "ses-a" }), /not found/)
+})
+
 test("list_agents hides offline peers by default, includes them on request", async () => {
   const listed = [
     { entry: peerEntry(), alive: true, staleReason: null },

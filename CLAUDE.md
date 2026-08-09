@@ -11,16 +11,16 @@ Cross-session messaging plugin for opencode: independent instances on the same m
 
 ## Architecture notes
 
-- One registry file per instance in `$XDG_DATA_HOME/opencode-plugin-peers/peers.d/` (0600, atomic write, 10s heartbeat; alive = fresh heartbeat + live PID + `/health` probe).
+- Protocol v2 writes one registry file per session endpoint plus a v1 compatibility entry in `$XDG_DATA_HOME/opencode-plugin-peers/peers.d/` (0600, atomic write, 10s heartbeat).
 - Each instance runs a 127.0.0.1-only inbox listener (random port, bearer token from its registry file). Peers never call each other's opencode server directly.
-- Delivery: queue while busy, flush on `session.idle` (+15s fallback sweep) via own `client.session.promptAsync` — injected messages are ordinary synthetic user messages (parts carry `metadata.peerMessage: true`).
+- Delivery: one durable spool per endpoint; accepted messages use one immediate `promptAsync` call each, including while busy. Final ACKs are durably retried into sender outboxes.
 - Permissions: opencode 1.18 does **not** invoke the plugin SDK's `permission.ask` hook. Instead the plugin listens for `permission.asked` / `permission.v2.asked` bus events and answers via `client.postSessionIdPermissionsPermissionId` (must be called as a method — it needs `this`). A turn is peer-triggered when walking from the event's `tool.messageID` (v2: `source.messageID`) up `parentID` reaches an injected user message (parts carry `metadata.peerMessage: true`). Auto-reply is `"once"` (allow) or `"reject"` (deny) per the `peerPermissions` option (default `"allow"`); local user turns get no reply.
 - No toast popups: command results go inline via `consumeCommand`; held-message notices use `delivery.notice()` (inline, idle-only); init-time name conflicts are logged only.
 - Plugin options arrive as the **second `Plugin` argument** (tuple form in config), not on `ctx` — keep the dual read in `src/index.ts`.
 - Modules use factory functions, not `class` + `new` (opencode's loader can break `new`).
 - Commands (`/peers*`) are intercepted in `command.execute.before`; the result is written back into the first text part so it also works headless.
 - Single-Enter execution: `exports["./tui"]` → `src/tui.ts` registers the 4 commands as palette commands **without `slashName`** (a slashName adds a second, duplicate autocomplete row) plus a **priority-10 `return` binding** whose sync handler executes the command via `client.session.command()` when the focused prompt holds exactly one of our commands — or a prefix uniquely identifying one (cached `client.command.list()` + keymap slash names, minus our four, disambiguate). Any other text returns `false` and the keymap falls through to stock bindings (autocomplete select / input submit). Guards: dialogs open → false, non-session route → false. The handler must stay synchronous — the keymap treats any Promise result as handled. The TUI loads plugins from **`~/.config/opencode/tui.json`**, not `opencode.json` — both lists need the plugin.
-- `src/tui.ts` must compile to a **zero-runtime-import** `dist/tui.js` (`@opencode-ai/plugin/tui` re-exports `@opentui/keymap` at runtime, unresolvable inside the TUI process): `import type` only, no sibling-module imports — command names are deliberately duplicated from `COMMAND_NAMES`. Guarded by a tests/tui.test.mjs invariant.
+- `src/tui.ts` must compile to a **zero-runtime-import** `dist/tui.js` (`@opencode-ai/plugin/tui` re-exports `@opentui/keymap` at runtime, unresolvable inside the TUI process): `import type` only, no sibling-module imports — command names are deliberately duplicated from `COMMAND_NAMES`. Palette actions use host dialogs and require explicit selection/confirmation. Guarded by a tests/tui.test.mjs invariant.
 
 ## Development workflow
 

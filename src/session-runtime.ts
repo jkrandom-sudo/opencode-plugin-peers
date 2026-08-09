@@ -10,7 +10,7 @@ import {
 } from "./queue.js"
 import type { RegistryEndpoint } from "./registry.js"
 import { SessionTracker, type SessionTrackerInstance } from "./session-tracker.js"
-import type { InboundMessage, InboundPolicy, Logger, ReceiveStatus, SessionEndpointStatus } from "./types.js"
+import type { InboundMessage, InboundPolicy, Logger, PeerAcknowledgementV2, ReceiveStatus, SessionEndpointStatus } from "./types.js"
 
 type Client = PluginInput["client"]
 
@@ -53,6 +53,7 @@ export interface SessionRuntimeInstance {
   queueForSession: (sessionId: string) => QueueInstance | null
   deliveryForSession: (sessionId: string) => DeliveryInstance | null
   sweep: () => Promise<void>
+  pendingAcknowledgements: () => Array<{ queue: QueueInstance; acknowledgement: PeerAcknowledgementV2 }>
 }
 
 function responseData<T>(response: unknown): T | undefined {
@@ -246,7 +247,7 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
         const existing = endpoint.queue.existingStatus(message)
         if (existing) return existing
         if (endpoint.queue.isDebounced(message)) return "duplicate"
-        const decision = gateMessage(policy, message)
+        const decision = gateMessage(policy, message, endpoint.session.directory || opts.directory)
         if (decision === "refuse") return (await endpoint.queue.refuse(message)).status
         if (decision === "hold") {
           if (!(await endpoint.queue.hold(message))) return "full"
@@ -319,6 +320,11 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
           await endpoint.delivery.flush()
         }
       })
+    },
+
+    pendingAcknowledgements() {
+      return [...endpoints.values()].flatMap((endpoint) => endpoint.queue.pendingAcknowledgements()
+        .map((acknowledgement) => ({ queue: endpoint.queue, acknowledgement })))
     },
   }
 }
