@@ -71,7 +71,15 @@ export interface HeldMessage extends InboundMessage {
   expiresAt: number
 }
 
-export type ReceiveStatus = "delivered" | "queued" | "held" | "refused" | "full" | "duplicate"
+export type ReceiveStatus =
+  | "delivered"
+  | "queued"
+  | "held"
+  | "refused"
+  | "expired"
+  | "dropped"
+  | "full"
+  | "duplicate"
 
 export interface PluginConfig {
   /** Override the storage dir (defaults to $XDG_DATA_HOME/opencode-plugin-peers). */

@@ -25,9 +25,11 @@ import type { Hooks, Plugin, PluginModule } from "@opencode-ai/plugin"
 import { resolveConfig } from "./config.js"
 import { Registry, newInboxToken, newInstanceId, uniqueName } from "./registry.js"
 import { InboxListener } from "./listener.js"
-import { MessageQueue, RateLimiter } from "./queue.js"
+import { createProcessMessageQueue, RateLimiter } from "./queue.js"
+import type { QueueInstance } from "./queue.js"
 import { SessionTracker } from "./session-tracker.js"
 import { Delivery } from "./delivery.js"
+import type { DeliveryInstance } from "./delivery.js"
 import { Sender } from "./sender.js"
 import { gateMessage } from "./gating.js"
 import { PeerPermissions } from "./permissions.js"
@@ -38,6 +40,14 @@ import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 
 const PLUGIN_VERSION = "0.1.7"
 const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox"])
+
+export async function runReliabilitySweep(
+  queue: QueueInstance,
+  delivery: Pick<DeliveryInstance, "flush">
+): Promise<void> {
+  await queue.expireHeld()
+  await delivery.flush()
+}
 
 export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   const logger = createLogger(ctx.client)
@@ -51,12 +61,9 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   const instanceId = newInstanceId()
   const inboxToken = newInboxToken()
   const tracker = SessionTracker()
-  const queue = MessageQueue({
-    endpointId: instanceId,
-    maxQueue: config.maxQueue,
-    maxHeld: config.maxHeld,
-    heldExpiryMs: config.heldExpiryMs,
-    inboxFile: config.inboxFile,
+  const queue = createProcessMessageQueue({
+    config,
+    directory: ctx.directory,
     logger,
   })
   await queue.loadHeld()
@@ -88,8 +95,8 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
       if (!recvLimit(msg.from.instanceId)) return "full"
       const decision = gateMessage(policy, msg)
       if (decision === "refuse") {
-        await queue.refuse(msg)
-        return "refused"
+        const ack = await queue.refuse(msg)
+        return ack.status === "duplicate" ? (queue.existingStatus(msg) ?? "duplicate") : ack.status
       }
       if (decision === "hold") {
         const ok = await queue.hold(msg)
@@ -161,6 +168,14 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     }
   }
 
+  const sweepReliability = async (): Promise<void> => {
+    try {
+      await runReliabilitySweep(queue, delivery)
+    } catch (err) {
+      await logger("error", "reliability sweep failed", { error: errorMessage(err) })
+    }
+  }
+
   const permissions = PeerPermissions({
     client: ctx.client,
     mode: () => config.peerPermissions,
@@ -171,7 +186,7 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   // Fallback sweep: session.idle is not guaranteed on every version/scenario,
   // so poll idle state periodically as a safety net.
   const sweeper = setInterval(() => {
-    flushIfIdle()
+    void sweepReliability()
   }, config.sweepMs)
   sweeper.unref?.()
 
@@ -267,7 +282,7 @@ export const plugin: PluginModule = {
 export default plugin
 
 export { Registry, uniqueName } from "./registry.js"
-export { MessageQueue, RateLimiter } from "./queue.js"
+export { MessageQueue, RateLimiter, createProcessMessageQueue, stableSpoolEndpointId } from "./queue.js"
 export { SessionTracker } from "./session-tracker.js"
 export { Delivery, formatMessages } from "./delivery.js"
 export { Sender, buildMessage } from "./sender.js"

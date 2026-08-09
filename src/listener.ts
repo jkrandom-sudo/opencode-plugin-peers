@@ -7,7 +7,7 @@
 import { createServer, type Server } from "node:http"
 import type { AddressInfo } from "node:net"
 import { z } from "zod"
-import type { InboundMessage, Logger, ReceiveStatus } from "./types.js"
+import type { InboundMessage, Logger, PeerMessageV2, ReceiveStatus } from "./types.js"
 
 export interface ListenerOptions {
   token: string
@@ -27,21 +27,36 @@ export interface ListenerInstance {
 
 const MAX_HOPS = 4
 
-const inboundMessageSchema = z
+const peerFromSchema = z
+  .object({
+    instanceId: z.string().min(1),
+    name: z.string().min(1),
+    directory: z.string().min(1),
+  })
+  .passthrough()
+
+const inboundMessageV1Schema = z
   .object({
     id: z.string().min(1),
-    from: z
-      .object({
-        instanceId: z.string().min(1),
-        name: z.string().min(1),
-        directory: z.string().min(1),
-      })
-      .strict(),
+    from: peerFromSchema,
     text: z.string(),
     via: z.array(z.string()).max(MAX_HOPS),
     sentAt: z.number().finite(),
   })
-  .strict()
+  .passthrough()
+
+const inboundMessageV2Schema = z
+  .object({
+    version: z.literal(2),
+    messageId: z.string().min(1),
+    fromEndpointId: z.string().min(1),
+    toEndpointId: z.string().min(1),
+    from: peerFromSchema,
+    text: z.string(),
+    via: z.array(z.string()).max(MAX_HOPS),
+    sentAt: z.number().finite(),
+  })
+  .passthrough()
 
 function statusToHttp(status: ReceiveStatus): number {
   switch (status) {
@@ -55,7 +70,23 @@ function statusToHttp(status: ReceiveStatus): number {
 }
 
 function parseMessage(body: unknown): InboundMessage | null {
-  const parsed = inboundMessageSchema.safeParse(body)
+  if (typeof body === "object" && body !== null && "version" in body && body.version === 2) {
+    const parsed = inboundMessageV2Schema.safeParse(body)
+    if (!parsed.success) return null
+    const message = parsed.data as PeerMessageV2
+    return {
+      id: message.messageId,
+      from: {
+        instanceId: message.fromEndpointId,
+        name: message.from.name,
+        directory: message.from.directory,
+      },
+      text: message.text,
+      via: message.via,
+      sentAt: message.sentAt,
+    }
+  }
+  const parsed = inboundMessageV1Schema.safeParse(body)
   return parsed.success ? parsed.data : null
 }
 

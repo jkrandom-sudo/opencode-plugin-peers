@@ -151,6 +151,67 @@ test("listener rejects a message whose hop list contains a non-string", async ()
   }
 })
 
+test("listener keeps protocol v1 forward-compatible with unknown fields", async () => {
+  const received = []
+  const { listener, url } = await startListener(async (message) => {
+    received.push(message)
+    return "queued"
+  })
+  try {
+    const message = buildMessage(self, "future v1")
+    message.futureEnvelopeField = { enabled: true }
+    message.from = { ...message.from, futureSenderField: "preserved compatibility" }
+    const res = await fetch(`${url}/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer secret" },
+      body: JSON.stringify(message),
+    })
+
+    assert.equal(res.status, 202)
+    assert.equal(received.length, 1)
+    assert.equal(received[0].id, message.id)
+  } finally {
+    await listener.stop()
+  }
+})
+
+test("listener accepts and normalizes protocol v2 envelopes", async () => {
+  const received = []
+  const { listener, url } = await startListener(async (message) => {
+    received.push(message)
+    return "queued"
+  })
+  try {
+    const sentAt = Date.now()
+    const res = await fetch(`${url}/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer secret" },
+      body: JSON.stringify({
+        version: 2,
+        messageId: "v2-message",
+        fromEndpointId: "endpoint-v2",
+        toEndpointId: "receiver-v2",
+        from: { instanceId: "legacy-sender", name: "future peer", directory: "/tmp/future", extra: true },
+        text: "hello from v2",
+        via: ["endpoint-v2"],
+        sentAt,
+        futureEnvelopeField: true,
+      }),
+    })
+
+    assert.equal(res.status, 202)
+    assert.deepEqual(received, [{
+      id: "v2-message",
+      from: { instanceId: "endpoint-v2", name: "future peer", directory: "/tmp/future" },
+      text: "hello from v2",
+      via: ["endpoint-v2"],
+      sentAt,
+    }])
+  } finally {
+    await listener.stop()
+  }
+})
+
 test("sender maps refused and full statuses", async () => {
   const { listener: l1, url: u1 } = await startListener(async () => "refused")
   const { listener: l2, url: u2 } = await startListener(async () => "full")
