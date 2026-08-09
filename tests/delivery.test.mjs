@@ -56,7 +56,7 @@ test("flush delivers only when idle with an active session", async () => {
     assert.equal(calls.length, 1)
     assert.equal(calls[0].path.id, "ses_1")
     const text = calls[0].body.parts[0].text
-    assert.match(text, /\[peer message from "beta" @ \/tmp\/b\]/)
+    assert.match(text, /\[peer message from "beta" @ \/tmp\/b; sender endpoint: aaaa1111\]/)
     assert.match(text, /hello 1/)
     assert.match(text, /peerPermissions/)
     assert.match(text, /send_message/)
@@ -138,6 +138,8 @@ test("flush injects one prompt per peer message immediately while the exact sess
       fromEndpointId: "aaaa1111",
       toSessionId: "ses_1",
     })
+    assert.match(calls[0].body.parts[0].text, /sender endpoint: aaaa1111/)
+    assert.match(calls[0].body.parts[0].text, /reply.*exact endpoint ID "aaaa1111"/i)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -209,6 +211,40 @@ test("failed injection requeues messages in order", async () => {
   }
 })
 
+test("resolved promptAsync SDK errors requeue instead of completing durable records", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-delivery-"))
+  try {
+    const tracker = SessionTracker()
+    tracker.noteUserActivity("ses_1")
+    const queue = await makeQueue(dir)
+    queue.enqueue(msg("resolved-sdk-error"))
+    const client = {
+      session: {
+        promptAsync: async () => ({
+          error: { name: "ApiError", message: "session is unavailable" },
+          response: { ok: false, status: 503, statusText: "Service Unavailable" },
+        }),
+      },
+    }
+    const delivery = Delivery({
+      client,
+      tracker,
+      queue,
+      directory: "/tmp/a",
+      logger: noopLogger,
+      immediate: true,
+    })
+
+    assert.equal(await delivery.flush(), false)
+    assert.deepEqual(queue.pending().map((message) => message.id), ["resolved-sdk-error"])
+    assert.equal((await readdir(join(dir, "spool", "legacy", "done"))).length, 0)
+    assert.equal((await readdir(join(dir, "spool", "legacy", "inflight"))).length, 0)
+    assert.equal((await readdir(join(dir, "spool", "legacy", "queued"))).length, 1)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("tracker: deleted session clears active", () => {
   const t = SessionTracker()
   t.noteUserActivity("ses_1")
@@ -220,5 +256,6 @@ test("tracker: deleted session clears active", () => {
 test("formatMessages escapes nothing but structures blocks", () => {
   const out = formatMessages([msg("1")])
   assert.ok(out.startsWith('[peer message from "beta"'))
-  assert.ok(out.endsWith("the sender's name."))
+  assert.match(out, /sender endpoint: aaaa1111/)
+  assert.ok(out.endsWith('the sender\'s exact endpoint ID "aaaa1111".'))
 })

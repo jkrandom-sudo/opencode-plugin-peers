@@ -24,6 +24,10 @@ function entryId(entry: ListedPeer["entry"]): string {
   return entry.version === 2 ? entry.endpointId : entry.instanceId
 }
 
+function isEndpointShaped(target: string): boolean {
+  return /^(?:session|workspace)-[A-Za-z0-9][A-Za-z0-9_-]*$/.test(target)
+}
+
 export function formatPeerList(peers: ListedPeer[], selfName: string, selfId: string): string {
   const online = peers.filter((p) => p.alive)
   const offline = peers.filter((p) => !p.alive)
@@ -99,14 +103,23 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
         }
         const selfId = self?.endpointId ?? deps.selfInstanceId
         const listed = await deps.registry.list()
-        const peers = listed.filter((p) => p.alive && entryId(p.entry) !== selfId)
         const target = args.to.trim()
-        const exact = peers.find((p) => entryId(p.entry) === target)
-        const matches = exact ? [exact] : peers.filter((p) => p.entry.name === target)
+        const knownExact = listed.find((peer) => entryId(peer.entry) === target)
+        if (knownExact) {
+          if (entryId(knownExact.entry) === selfId) {
+            return `Error: cannot send a peer message to your own endpoint "${target}" in the same session.`
+          }
+          if (!knownExact.alive) {
+            return `Error: endpoint "${target}" appears offline (${knownExact.staleReason}).`
+          }
+        } else if (isEndpointShaped(target)) {
+          return `Error: unknown endpoint ID "${target}".`
+        }
+
+        const peers = listed.filter((p) => p.alive && entryId(p.entry) !== selfId)
+        const matches = knownExact ? [knownExact] : peers.filter((p) => p.entry.name === target)
         if (matches.length === 0) {
-          const stale = listed.find(
-            (p) => !p.alive && (p.entry.name === target || entryId(p.entry) === target)
-          )
+          const stale = listed.find((p) => !p.alive && p.entry.name === target)
           if (stale) {
             return `Error: peer "${target}" appears offline (${stale.staleReason}).`
           }

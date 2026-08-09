@@ -4,9 +4,9 @@
  * so inbound gating (accept/hold/refuse) and queueing stay under our control.
  */
 
-import { chmod, mkdir, rm } from "node:fs/promises"
+import { chmod, lstat, mkdir, rm } from "node:fs/promises"
 import { createServer, type Server } from "node:http"
-import type { AddressInfo } from "node:net"
+import { connect, type AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { z } from "zod"
@@ -41,7 +41,13 @@ export interface ListenerOptions {
 }
 
 export interface ListenerInstance {
-  start: () => Promise<{ port: number; url: string; address: LocalTransportAddress }>
+  start: () => Promise<{
+    port: number
+    url: string
+    address: LocalTransportAddress
+    /** Ordinary loopback HTTP URL published to protocol-v1 peers. */
+    compatibilityUrl: string
+  }>
   stop: () => Promise<void>
 }
 
@@ -132,7 +138,10 @@ export function defaultRuntimeDirectory(
 }
 
 export function InboxListener(opts: ListenerOptions): ListenerInstance {
-  let server: Server | null = null
+  let primaryServer: Server | null = null
+  let compatibilityServer: Server | null = null
+  let ownedSocketPath: string | null = null
+  let lifecycle: "new" | "starting" | "running" | "stopping" | "stopped" = "new"
 
   function authorized(authHeader: string | undefined): boolean {
     return authHeader === `Bearer ${opts.token}`
@@ -222,70 +231,162 @@ export function InboxListener(opts: ListenerOptions): ListenerInstance {
     }
   }
 
-  return {
-    start() {
-      return new Promise(async (resolve, reject) => {
-        server = createServer((req, res) => {
-          handle(req, res).catch((err) => {
-            opts.logger("error", "listener error", { error: String(err) })
-            if (!res.headersSent) {
-              res.writeHead(500).end()
-            } else {
-              res.end()
-            }
-          })
-        })
-        server.once("error", reject)
-        // Keep direct legacy InboxListener callers on loopback TCP. The
-        // process runtime passes a processId and therefore selects the
-        // platform-default UDS path on macOS/Linux.
-        const platform = opts.platform ?? (opts.processId ? process.platform : "win32")
-        if (platform !== "win32") {
-          const directory = opts.runtimeDir ?? defaultRuntimeDirectory()
-          const socketPath = join(directory, `${opts.processId ?? process.pid}.sock`)
-          try {
-            await mkdir(directory, { recursive: true, mode: 0o700 })
-            await chmod(directory, 0o700)
-            await rm(socketPath, { force: true })
-          } catch (err) {
-            reject(err)
-            return
-          }
-          server.listen(socketPath, async () => {
-            try {
-              await chmod(socketPath, 0o600)
-              resolve({
-                port: 0,
-                url: `http+unix://${encodeURIComponent(socketPath)}`,
-                address: { type: "unix", path: socketPath },
-              })
-            } catch (err) {
-              reject(err)
-            }
-          })
-          return
-        }
-        server.listen(0, "127.0.0.1", () => {
-          const addr = server!.address() as AddressInfo
-          resolve({
-            port: addr.port,
-            url: `http://127.0.0.1:${addr.port}`,
-            address: { type: "tcp", host: "127.0.0.1", port: addr.port },
-          })
-        })
+  function listenerServer(): Server {
+    return createServer((req, res) => {
+      handle(req, res).catch((err) => {
+        void opts.logger("error", "listener error", { error: String(err) })
+        if (!res.headersSent) res.writeHead(500).end()
+        else res.end()
       })
+    })
+  }
+
+  function listenUnix(server: Server, socketPath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const onError = (err: Error) => {
+        server.off("listening", onListening)
+        reject(err)
+      }
+      const onListening = () => {
+        server.off("error", onError)
+        resolve()
+      }
+      server.once("error", onError)
+      server.once("listening", onListening)
+      server.listen(socketPath)
+    })
+  }
+
+  function listenTcp(server: Server): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const onError = (err: Error) => {
+        server.off("listening", onListening)
+        reject(err)
+      }
+      const onListening = () => {
+        server.off("error", onError)
+        resolve((server.address() as AddressInfo).port)
+      }
+      server.once("error", onError)
+      server.once("listening", onListening)
+      server.listen(0, "127.0.0.1")
+    })
+  }
+
+  function closeServer(server: Server | null): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (!server?.listening) {
+        resolve()
+        return
+      }
+      server.close((err) => err ? reject(err) : resolve())
+    })
+  }
+
+  function liveUnixSocket(socketPath: string): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+      const socket = connect({ path: socketPath })
+      let settled = false
+      const finish = (result: boolean, err?: Error) => {
+        if (settled) return
+        settled = true
+        socket.destroy()
+        if (err) reject(err)
+        else resolve(result)
+      }
+      socket.once("connect", () => finish(true))
+      socket.once("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "ECONNREFUSED" || err.code === "ENOENT") finish(false)
+        else finish(false, err)
+      })
+      socket.setTimeout(500, () => finish(true))
+    })
+  }
+
+  async function prepareUnixSocket(socketPath: string): Promise<void> {
+    try {
+      const info = await lstat(socketPath)
+      if (!info.isSocket()) throw new Error(`runtime socket path collision: ${socketPath}`)
+      if (await liveUnixSocket(socketPath)) throw new Error(`runtime socket already in use: ${socketPath}`)
+      await rm(socketPath)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err
+    }
+  }
+
+  return {
+    async start() {
+      if (lifecycle !== "new") throw new Error(`listener cannot start while ${lifecycle}`)
+      lifecycle = "starting"
+      const platform = opts.platform ?? (opts.processId ? process.platform : "win32")
+      if (platform === "win32") {
+        primaryServer = listenerServer()
+        try {
+          const port = await listenTcp(primaryServer)
+          lifecycle = "running"
+          const url = `http://127.0.0.1:${port}`
+          return {
+            port,
+            url,
+            compatibilityUrl: url,
+            address: { type: "tcp", host: "127.0.0.1", port },
+          }
+        } catch (err) {
+          await closeServer(primaryServer).catch(() => {})
+          primaryServer = null
+          lifecycle = "stopped"
+          throw err
+        }
+      }
+
+      const directory = opts.runtimeDir ?? defaultRuntimeDirectory()
+      const socketPath = join(directory, `${opts.processId ?? process.pid}.sock`)
+      let boundUnixSocket = false
+      try {
+        await mkdir(directory, { recursive: true, mode: 0o700 })
+        await chmod(directory, 0o700)
+        await prepareUnixSocket(socketPath)
+
+        primaryServer = listenerServer()
+        await listenUnix(primaryServer, socketPath)
+        boundUnixSocket = true
+        ownedSocketPath = socketPath
+        await chmod(socketPath, 0o600)
+
+        compatibilityServer = listenerServer()
+        const compatibilityPort = await listenTcp(compatibilityServer)
+        lifecycle = "running"
+        return {
+          port: compatibilityPort,
+          url: `http+unix://${encodeURIComponent(socketPath)}`,
+          compatibilityUrl: `http://127.0.0.1:${compatibilityPort}`,
+          address: { type: "unix", path: socketPath },
+        }
+      } catch (err) {
+        await Promise.all([
+          closeServer(compatibilityServer).catch(() => {}),
+          closeServer(primaryServer).catch(() => {}),
+        ])
+        compatibilityServer = null
+        primaryServer = null
+        if (boundUnixSocket) await rm(socketPath, { force: true }).catch(() => {})
+        ownedSocketPath = null
+        lifecycle = "stopped"
+        throw err
+      }
     },
 
-    stop() {
-      return new Promise((resolve) => {
-        if (!server) return resolve()
-        const address = server.address()
-        server.close(() => {
-          if (typeof address === "string") void rm(address, { force: true }).finally(resolve)
-          else resolve()
-        })
-        server = null
-      })
+    async stop() {
+      if (lifecycle === "stopped") return
+      lifecycle = "stopping"
+      const unixPath = ownedSocketPath
+      const servers = [compatibilityServer, primaryServer]
+      compatibilityServer = null
+      primaryServer = null
+      ownedSocketPath = null
+      await Promise.all(servers.map((server) => closeServer(server)))
+      if (unixPath) await rm(unixPath, { force: true })
+      lifecycle = "stopped"
     },
   }
 }

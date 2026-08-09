@@ -292,3 +292,40 @@ test("concurrent v2 heartbeats publish complete registry files", async () => {
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test("registry stop rejects late heartbeats and leaves no republished files", async () => {
+  const dir = await makeDir()
+  try {
+    let dynamicReads = 0
+    const reg = makeRegistry(dir, dyn, {
+      instanceId: "stopping-process",
+      getDynamic: () => { dynamicReads++; return dyn },
+      getEndpoints: () => [{
+        endpointId: "session-stopping",
+        sessionId: "ses_stopping",
+        title: "stopping",
+        name: "project",
+        directory: "/tmp/proj",
+        status: "idle",
+        startedAt: 1,
+        updatedAt: 1,
+        queuedCount: 0,
+      }],
+      transport: { type: "unix", path: "/tmp/stopping.sock" },
+    })
+    await reg.start()
+    const readsBeforeStop = dynamicReads
+
+    const stopping = reg.stop()
+    const lateHeartbeat = reg.heartbeat()
+    await Promise.all([stopping, lateHeartbeat])
+    assert.equal(dynamicReads, readsBeforeStop)
+    assert.deepEqual(await readdir(dir), [])
+
+    await reg.heartbeat()
+    assert.equal(dynamicReads, readsBeforeStop)
+    assert.deepEqual(await readdir(dir), [])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

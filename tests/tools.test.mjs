@@ -156,6 +156,31 @@ test("send_message reports unknown, offline and ambiguous targets", async () => 
   assert.equal(sender.calls.length, 0)
 })
 
+test("exact self, offline, and unknown endpoint IDs never fall back to colliding names", async () => {
+  const listed = [
+    { entry: peerEntry({ instanceId: "session-self-id", name: "self endpoint" }), alive: true, staleReason: null },
+    { entry: peerEntry({ instanceId: "online-name-one", name: "session-self-id" }), alive: true, staleReason: null },
+    { entry: peerEntry({ instanceId: "session-offline-id", name: "offline endpoint" }), alive: false, staleReason: "last heartbeat 90s ago" },
+    { entry: peerEntry({ instanceId: "online-name-two", name: "session-offline-id" }), alive: true, staleReason: null },
+    { entry: peerEntry({ instanceId: "online-name-three", name: "session-unknown-id" }), alive: true, staleReason: null },
+  ]
+  const { tools, sender } = makeTools({ listed, over: { selfInstanceId: "session-self-id" } })
+
+  assert.match(
+    await tools.send_message.execute({ to: "session-self-id", message: "hi" }, {}),
+    /cannot send.*same session|your own endpoint/i
+  )
+  assert.match(
+    await tools.send_message.execute({ to: "session-offline-id", message: "hi" }, {}),
+    /endpoint.*offline|appears offline/i
+  )
+  assert.match(
+    await tools.send_message.execute({ to: "session-unknown-id", message: "hi" }, {}),
+    /unknown endpoint ID/i
+  )
+  assert.equal(sender.calls.length, 0)
+})
+
 test("send_message maps all receiver statuses", async () => {
   const listed = [{ entry: peerEntry(), alive: true, staleReason: null }]
   const cases = [

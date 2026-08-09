@@ -2,7 +2,12 @@ import type { PluginInput } from "@opencode-ai/plugin"
 import type { ResolvedConfig } from "./config.js"
 import { Delivery, type DeliveryInstance } from "./delivery.js"
 import { gateMessage } from "./gating.js"
-import { createSessionMessageQueue, stableSessionEndpointId, type QueueInstance } from "./queue.js"
+import {
+  createSessionMessageQueue,
+  migrateWorkspaceSpool,
+  stableSessionEndpointId,
+  type QueueInstance,
+} from "./queue.js"
 import type { RegistryEndpoint } from "./registry.js"
 import { SessionTracker, type SessionTrackerInstance } from "./session-tracker.js"
 import type { InboundMessage, InboundPolicy, Logger, ReceiveStatus, SessionEndpointStatus } from "./types.js"
@@ -37,6 +42,7 @@ export interface SessionRuntimeOptions {
 
 export interface SessionRuntimeInstance {
   initialize: () => Promise<void>
+  stop: () => Promise<void>
   registryEndpoints: () => RegistryEndpoint[]
   compatibilityEndpointId: () => string | null
   hasEndpoint: (endpointId: string) => boolean
@@ -60,6 +66,26 @@ function normalizeStatus(status: unknown): SessionEndpointStatus {
 
 export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInstance {
   const endpoints = new Map<string, RuntimeEndpoint>()
+  const pendingOperations = new Set<Promise<unknown>>()
+  let lifecycle: "running" | "stopping" | "stopped" = "running"
+  let stopPromise: Promise<void> | null = null
+
+  function whileRunning<T>(fallback: T, operation: () => Promise<T>): Promise<T> {
+    if (lifecycle !== "running") return Promise.resolve(fallback)
+    const pending = operation()
+    pendingOperations.add(pending)
+    void pending.finally(() => pendingOperations.delete(pending)).catch(() => {})
+    return pending
+  }
+
+  function compatibilityEndpoint(candidates = [...endpoints.values()]): RuntimeEndpoint | null {
+    const roots = candidates.filter((candidate) => !candidate.session.parentID)
+    return (roots.length > 0 ? roots : candidates).slice().sort((a, b) =>
+      b.updatedAt - a.updatedAt ||
+      b.session.time.created - a.session.time.created ||
+      b.session.id.localeCompare(a.session.id)
+    )[0] ?? null
+  }
 
   async function upsert(session: OpenCodeSession, status?: SessionEndpointStatus): Promise<RuntimeEndpoint> {
     const current = endpoints.get(session.id)
@@ -103,7 +129,7 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
     else endpoint.tracker.noteBusy(endpoint.session.id)
   }
 
-  async function loadChildren(root: OpenCodeSession): Promise<void> {
+  async function loadChildren(root: OpenCodeSession, statuses: Record<string, unknown> = {}): Promise<void> {
     const seen = new Set<string>()
     const pending = [root]
     while (pending.length > 0) {
@@ -116,7 +142,10 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
           query: { directory: parent.directory || opts.directory },
         })
         for (const child of responseData<OpenCodeSession[]>(response) ?? []) {
-          await upsert(child)
+          const childStatus = Object.prototype.hasOwnProperty.call(statuses, child.id)
+            ? normalizeStatus(statuses[child.id])
+            : undefined
+          await upsert(child, childStatus)
           pending.push(child)
         }
       } catch (err) {
@@ -144,17 +173,43 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
   }
 
   return {
-    async initialize() {
-      const [listedResponse, statusResponse] = await Promise.all([
-        opts.client.session.list({ query: { directory: opts.directory } }),
-        opts.client.session.status({ query: { directory: opts.directory } }),
-      ])
-      const sessions = responseData<OpenCodeSession[]>(listedResponse) ?? []
-      const statuses = responseData<Record<string, unknown>>(statusResponse) ?? {}
-      for (const session of sessions) {
-        await upsert(session, normalizeStatus(statuses[session.id]))
-      }
-      for (const session of sessions) await loadChildren(session)
+    initialize() {
+      return whileRunning(undefined, async () => {
+        const [listedResponse, statusResponse] = await Promise.all([
+          opts.client.session.list({ query: { directory: opts.directory } }),
+          opts.client.session.status({ query: { directory: opts.directory } }),
+        ])
+        const sessions = responseData<OpenCodeSession[]>(listedResponse) ?? []
+        const statuses = responseData<Record<string, unknown>>(statusResponse) ?? {}
+        const migrationTarget = (sessions.filter((candidate) => !candidate.parentID).length > 0
+          ? sessions.filter((candidate) => !candidate.parentID)
+          : sessions
+        ).slice().sort((a, b) =>
+          b.time.updated - a.time.updated || b.time.created - a.time.created || b.id.localeCompare(a.id)
+        )[0]
+        if (migrationTarget) {
+          await migrateWorkspaceSpool({
+            config: opts.config,
+            directory: opts.directory,
+            targetSessionId: migrationTarget.id,
+            logger: opts.logger,
+          })
+        }
+        for (const session of sessions) {
+          await upsert(session, normalizeStatus(statuses[session.id]))
+        }
+        for (const session of sessions) await loadChildren(session, statuses)
+      })
+    },
+
+    stop() {
+      if (stopPromise) return stopPromise
+      lifecycle = "stopping"
+      stopPromise = (async () => {
+        await Promise.allSettled([...pendingOperations])
+        lifecycle = "stopped"
+      })()
+      return stopPromise
     },
 
     registryEndpoints() {
@@ -173,7 +228,7 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
     },
 
     compatibilityEndpointId() {
-      return [...endpoints.values()].sort((a, b) => b.updatedAt - a.updatedAt)[0]?.endpointId ?? null
+      return compatibilityEndpoint()?.endpointId ?? null
     },
 
     hasEndpoint(endpointId) {
@@ -184,52 +239,69 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
       return endpoints.get(sessionId)?.endpointId ?? null
     },
 
-    async receive(message, endpointId, policy) {
-      const endpoint = [...endpoints.values()].find((candidate) => candidate.endpointId === endpointId)
-      if (!endpoint) return "dropped"
-      const existing = endpoint.queue.existingStatus(message)
-      if (existing) return existing
-      if (endpoint.queue.isDebounced(message)) return "duplicate"
-      const decision = gateMessage(policy, message)
-      if (decision === "refuse") return (await endpoint.queue.refuse(message)).status
-      if (decision === "hold") {
-        if (!(await endpoint.queue.hold(message))) return "full"
-        void endpoint.delivery.notice(`📥 Held message from "${message.from.name}" — /peers-inbox to review`)
-        return "held"
-      }
-      if (!endpoint.queue.enqueue(message)) return endpoint.queue.existingStatus(message) ?? "full"
-      await endpoint.delivery.flush()
-      return endpoint.queue.existingStatus(message) ?? "queued"
+    receive(message, endpointId, policy) {
+      return whileRunning<ReceiveStatus>("dropped", async () => {
+        const endpoint = [...endpoints.values()].find((candidate) => candidate.endpointId === endpointId)
+        if (!endpoint) return "dropped"
+        const existing = endpoint.queue.existingStatus(message)
+        if (existing) return existing
+        if (endpoint.queue.isDebounced(message)) return "duplicate"
+        const decision = gateMessage(policy, message)
+        if (decision === "refuse") return (await endpoint.queue.refuse(message)).status
+        if (decision === "hold") {
+          if (!(await endpoint.queue.hold(message))) return "full"
+          void endpoint.delivery.notice(`📥 Held message from "${message.from.name}" — /peers-inbox to review`)
+          return "held"
+        }
+        if (!endpoint.queue.enqueue(message)) return endpoint.queue.existingStatus(message) ?? "full"
+        await endpoint.delivery.flush()
+        return endpoint.queue.existingStatus(message) ?? "queued"
+      })
     },
 
-    async handleEvent(event) {
-      const properties = event.properties ?? {}
-      const info = properties.info as OpenCodeSession | undefined
-      if (event.type === "session.created" || event.type === "session.updated") {
-        if (!info?.id) return false
-        await upsert(info)
-        if (event.type === "session.created") await loadChildren(info)
-        return true
-      }
-      if (event.type === "session.deleted") {
-        if (!info?.id) return false
-        endpoints.delete(info.id)
-        return true
-      }
-      if (event.type === "session.status" || event.type === "session.idle") {
-        const sessionId = properties.sessionID as string | undefined
-        if (!sessionId) return false
+    handleEvent(event) {
+      return whileRunning(false, async () => {
+        const properties = event.properties ?? {}
+        const info = properties.info as OpenCodeSession | undefined
+        if (event.type === "session.created" || event.type === "session.updated") {
+          if (!info?.id) return false
+          await upsert(info)
+          if (event.type === "session.created") await loadChildren(info)
+          return true
+        }
+        if (event.type === "session.deleted") {
+          if (!info?.id) return false
+          const deleted = new Set([info.id])
+          let changed = true
+          while (changed) {
+            changed = false
+            for (const endpoint of endpoints.values()) {
+              if (endpoint.session.parentID && deleted.has(endpoint.session.parentID) && !deleted.has(endpoint.session.id)) {
+                deleted.add(endpoint.session.id)
+                changed = true
+              }
+            }
+          }
+          for (const sessionId of deleted) endpoints.delete(sessionId)
+          return true
+        }
+        if (event.type === "session.status" || event.type === "session.idle") {
+          const sessionId = properties.sessionID as string | undefined
+          if (!sessionId) return false
+          const endpoint = await findSession(sessionId)
+          if (!endpoint) return false
+          setStatus(endpoint, event.type === "session.idle" ? "idle" : normalizeStatus(properties.status))
+          return true
+        }
+        return false
+      })
+    },
+
+    noteActivity(sessionId) {
+      return whileRunning(undefined, async () => {
         const endpoint = await findSession(sessionId)
-        if (!endpoint) return false
-        setStatus(endpoint, event.type === "session.idle" ? "idle" : normalizeStatus(properties.status))
-        return true
-      }
-      return false
-    },
-
-    async noteActivity(sessionId) {
-      const endpoint = await findSession(sessionId)
-      if (endpoint) setStatus(endpoint, "busy")
+        if (endpoint) setStatus(endpoint, "busy")
+      })
     },
 
     queueForSession(sessionId) {
@@ -240,11 +312,13 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
       return endpoints.get(sessionId)?.delivery ?? null
     },
 
-    async sweep() {
-      for (const endpoint of endpoints.values()) {
-        await endpoint.queue.expireHeld()
-        await endpoint.delivery.flush()
-      }
+    sweep() {
+      return whileRunning(undefined, async () => {
+        for (const endpoint of endpoints.values()) {
+          await endpoint.queue.expireHeld()
+          await endpoint.delivery.flush()
+        }
+      })
     },
   }
 }

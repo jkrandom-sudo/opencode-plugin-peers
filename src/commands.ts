@@ -18,6 +18,8 @@ export interface CommandContext {
   getName: () => string
   setName: (name: string) => Promise<{ name: string; changed: boolean }>
   selfInstanceId: string
+  /** Exact endpoint for the session that invoked this command. */
+  selfEndpointId?: string
 }
 
 export interface CommandResult {
@@ -32,7 +34,10 @@ export async function handlePeersCommand(
 ): Promise<CommandResult> {
   // "list-agents" is an alias of "peers", matching Claude Code's /list-agents.
   if (command === "peers" || command === "list-agents") {
-    const peers = await ctx.registry.list()
+    const selfId = ctx.selfEndpointId ?? ctx.selfInstanceId
+    const peers = (await ctx.registry.list()).filter((peer) =>
+      (peer.entry.version === 2 ? peer.entry.endpointId : peer.entry.instanceId) !== selfId
+    )
     const listing = formatSessionList(peers, Date.now())
     const held = ctx.queue.held()
     const pending = ctx.queue.size()

@@ -56,6 +56,8 @@ export interface RegistryOptions {
   getDynamic: () => RegistryDynamic
   /** Enables protocol-v2 publication while retaining one v1 compatibility file. */
   getEndpoints?: () => RegistryEndpoint[]
+  /** Exact endpoint used by protocol-v1 routing and publication. */
+  getCompatibilityEndpointId?: () => string | null
   transport?: LocalTransportAddress
   peerPermissions?: PeerPermissionMode
   logger: Logger
@@ -101,11 +103,16 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
   const selfV2Files = new Set<string>()
   let timer: ReturnType<typeof setInterval> | null = null
   let writeTail: Promise<void> = Promise.resolve()
+  let stopPromise: Promise<void> | null = null
+  let lifecycle: "new" | "running" | "stopping" | "stopped" = "new"
   const startedAt = Date.now()
 
   function compatibilityDynamic(): RegistryDynamic {
     const dyn = opts.getDynamic()
-    const latest = opts.getEndpoints?.().slice().sort((a, b) => b.updatedAt - a.updatedAt)[0]
+    const endpoints = opts.getEndpoints?.() ?? []
+    const compatibilityId = opts.getCompatibilityEndpointId?.()
+    const latest = endpoints.find((endpoint) => endpoint.endpointId === compatibilityId)
+      ?? endpoints.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0]
     if (!latest) return dyn
     return {
       name: latest.name,
@@ -205,7 +212,9 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
   }
 
   function scheduleWrite(): Promise<void> {
-    const pending = writeTail.then(writeSelf, writeSelf)
+    if (lifecycle !== "running") return Promise.resolve()
+    const writeIfRunning = () => lifecycle === "running" ? writeSelf() : Promise.resolve()
+    const pending = writeTail.then(writeIfRunning, writeIfRunning)
     writeTail = pending.catch(() => {})
     return pending
   }
@@ -233,9 +242,16 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
     selfFile,
 
     async start() {
+      if (lifecycle !== "new") throw new Error(`registry cannot start while ${lifecycle}`)
       await mkdir(opts.peersDir, { recursive: true, mode: 0o700 })
       await chmod(opts.peersDir, 0o700).catch(() => {})
-      await scheduleWrite()
+      lifecycle = "running"
+      try {
+        await scheduleWrite()
+      } catch (err) {
+        lifecycle = "stopped"
+        throw err
+      }
       timer = setInterval(() => {
         inst.heartbeat().catch((err) => {
           opts.logger("warn", "heartbeat failed", { error: String(err) })
@@ -245,16 +261,25 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
     },
 
     async stop() {
+      if (stopPromise) return stopPromise
+      if (lifecycle === "stopped") return
+      lifecycle = "stopping"
       if (timer) clearInterval(timer)
       timer = null
-      await writeTail
-      await rm(selfFile, { force: true })
-      await Promise.all([...selfV2Files].map((path) => rm(path, { force: true })))
-      selfV2Files.clear()
+      stopPromise = (async () => {
+        await writeTail
+        await rm(selfFile, { force: true })
+        await Promise.all([...selfV2Files].map((path) => rm(path, { force: true })))
+        selfV2Files.clear()
+        lifecycle = "stopped"
+      })()
+      return stopPromise
     },
 
     async heartbeat() {
+      if (lifecycle !== "running") return
       await scheduleWrite()
+      if (lifecycle !== "running") return
       await inst.cleanupStale()
     },
 
@@ -289,6 +314,7 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
     },
 
     async cleanupStale() {
+      if (lifecycle !== "running") return 0
       let files: string[] = []
       try {
         files = await readdir(opts.peersDir)

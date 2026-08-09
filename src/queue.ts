@@ -121,6 +121,194 @@ export interface QueueInstance {
   loadHeld: () => Promise<void>
 }
 
+interface LockableQueue extends QueueInstance {
+  withExclusiveLock: <T>(operation: () => T) => T
+}
+
+export interface SpoolMigrationResult {
+  migrated: number
+  deduplicated: number
+  quarantined: number
+  sourceEndpointId: string
+  targetEndpointId: string
+}
+
+function migrationStateFiles(spoolDir: string, state: SpoolState): string[] {
+  try {
+    return readdirSync(join(spoolDir, state)).filter((file) => file.endsWith(".json")).sort()
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return []
+    throw err
+  }
+}
+
+function syncMigrationDirectory(directory: string): void {
+  const fd = openSync(directory, "r")
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function ensureMigrationDirectory(directory: string): void {
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  chmodSync(directory, 0o700)
+}
+
+function persistMigrationRecord(target: string, record: unknown): void {
+  const directory = dirname(target)
+  ensureMigrationDirectory(directory)
+  const temporary = join(directory, `.${process.pid}.${randomBytes(8).toString("hex")}.tmp`)
+  const fd = openSync(temporary, "wx", 0o600)
+  try {
+    writeSync(fd, JSON.stringify(record))
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+  chmodSync(temporary, 0o600)
+  renameSync(temporary, target)
+  syncMigrationDirectory(directory)
+}
+
+function readSequence(path: string): number | null {
+  try {
+    const record = JSON.parse(readFileSync(path, "utf8")) as { value?: unknown }
+    return typeof record.value === "number" && Number.isSafeInteger(record.value) ? record.value : null
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null
+    throw err
+  }
+}
+
+function sameFileContents(first: string, second: string): boolean {
+  try {
+    return readFileSync(first, "utf8") === readFileSync(second, "utf8")
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Move Task 1's directory-scoped spool into Task 2's compatibility session.
+ * Individual renames are atomic and the operation is restart-safe. Both
+ * endpoint locks are acquired in endpoint-ID order so concurrent recovery
+ * cannot deadlock or race normal queue state transitions.
+ */
+export async function migrateWorkspaceSpool(opts: {
+  config: ResolvedConfig
+  directory: string
+  targetSessionId: string
+  logger: Logger
+}): Promise<SpoolMigrationResult> {
+  const sourceEndpointId = stableSpoolEndpointId(opts.directory)
+  const targetEndpointId = stableSessionEndpointId(opts.targetSessionId)
+  const result: SpoolMigrationResult = {
+    migrated: 0,
+    deduplicated: 0,
+    quarantined: 0,
+    sourceEndpointId,
+    targetEndpointId,
+  }
+  if (sourceEndpointId === targetEndpointId) return result
+
+  const sourceDir = join(dirname(opts.config.inboxFile), "spool", sourceEndpointId)
+  const targetDir = join(dirname(opts.config.inboxFile), "spool", targetEndpointId)
+  if (!existsSync(sourceDir)) return result
+  const sourceHasState = (['queued', 'held', 'inflight', 'done'] as SpoolState[])
+    .some((state) => migrationStateFiles(sourceDir, state).length > 0)
+  if (!sourceHasState && !existsSync(join(sourceDir, "sequence"))) return result
+
+  const queueOptions = {
+    maxQueue: opts.config.maxQueue,
+    maxHeld: opts.config.maxHeld,
+    heldExpiryMs: opts.config.heldExpiryMs,
+    inboxFile: opts.config.inboxFile,
+    logger: opts.logger,
+  }
+  const queues = new Map<string, LockableQueue>([
+    [sourceEndpointId, MessageQueue({ ...queueOptions, endpointId: sourceEndpointId }) as LockableQueue],
+    [targetEndpointId, MessageQueue({ ...queueOptions, endpointId: targetEndpointId }) as LockableQueue],
+  ])
+  const [firstId, secondId] = [sourceEndpointId, targetEndpointId].sort()
+  const collisions: Array<{ state: SpoolState; file: string; quarantine: string }> = []
+
+  queues.get(firstId)!.withExclusiveLock(() => {
+    queues.get(secondId)!.withExclusiveLock(() => {
+      for (const state of ["queued", "held", "inflight", "done"] as const) {
+        for (const file of migrationStateFiles(sourceDir, state)) {
+          const source = join(sourceDir, state, file)
+          const targetLocations = (["queued", "held", "inflight", "done"] as const)
+            .map((targetState) => join(targetDir, targetState, file))
+            .filter((path) => existsSync(path))
+          if (targetLocations.length === 0) {
+            const target = join(targetDir, state, file)
+            renameSync(source, target)
+            syncMigrationDirectory(join(sourceDir, state))
+            syncMigrationDirectory(join(targetDir, state))
+            result.migrated++
+            continue
+          }
+          if (targetLocations.length === 1 && targetLocations[0] === join(targetDir, state, file) && sameFileContents(source, targetLocations[0])) {
+            unlinkSync(source)
+            syncMigrationDirectory(join(sourceDir, state))
+            result.deduplicated++
+            continue
+          }
+
+          const base = join(targetDir, "migration-quarantine", sourceEndpointId, state)
+          ensureMigrationDirectory(base)
+          let quarantine = join(base, file)
+          if (existsSync(quarantine) && !sameFileContents(source, quarantine)) {
+            const digest = createHash("sha256").update(readFileSync(source)).digest("hex").slice(0, 16)
+            quarantine = join(base, `${file.slice(0, -5)}.${digest}.json`)
+          }
+          if (existsSync(quarantine) && sameFileContents(source, quarantine)) {
+            unlinkSync(source)
+          } else {
+            renameSync(source, quarantine)
+            syncMigrationDirectory(base)
+          }
+          syncMigrationDirectory(join(sourceDir, state))
+          result.quarantined++
+          collisions.push({ state, file, quarantine })
+        }
+      }
+
+      const sourceSequencePath = join(sourceDir, "sequence")
+      const targetSequencePath = join(targetDir, "sequence")
+      const sourceSequence = readSequence(sourceSequencePath)
+      const targetSequence = readSequence(targetSequencePath)
+      if (sourceSequence !== null) {
+        const mergedSequence = Math.max(sourceSequence, targetSequence ?? 0)
+        if (targetSequence !== mergedSequence) persistMigrationRecord(targetSequencePath, { value: mergedSequence })
+        unlinkSync(sourceSequencePath)
+        syncMigrationDirectory(sourceDir)
+      }
+
+      persistMigrationRecord(join(targetDir, ".migrations", `${sourceEndpointId}.json`), {
+        version: 1,
+        sourceEndpointId,
+        targetEndpointId,
+        completedAt: Date.now(),
+      })
+    })
+  })
+
+  for (const collision of collisions) {
+    await opts.logger("warn", "workspace spool record quarantined during session migration", {
+      sourceEndpointId,
+      targetEndpointId,
+      state: collision.state,
+      file: collision.file,
+      quarantine: collision.quarantine,
+    })
+  }
+  await opts.logger("info", "workspace spool migration completed", { ...result })
+  return result
+}
+
 export function MessageQueue(opts: QueueOptions): QueueInstance {
   let queue: InboundMessage[] = []
   let held: HeldMessage[] = []
@@ -500,7 +688,7 @@ export function MessageQueue(opts: QueueOptions): QueueInstance {
     return withEndpointLock(expireHeldRecordsLocked)
   }
 
-  return {
+  const instance: LockableQueue = {
     enqueue(msg) {
       return withEndpointLock(() => {
         if (existingState(msg)) return false
@@ -709,7 +897,12 @@ export function MessageQueue(opts: QueueOptions): QueueInstance {
         }
       })
     },
+
+    withExclusiveLock(operation) {
+      return withEndpointLock(operation)
+    },
   }
+  return instance
 }
 
 /** Per-key sliding-window rate limiter. */

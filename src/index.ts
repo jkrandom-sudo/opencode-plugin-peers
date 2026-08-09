@@ -90,11 +90,12 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     },
   })
 
-  const { url: inboxUrl, address: transport } = await listener.start()
+  const { url: transportUrl, compatibilityUrl: inboxUrl, address: transport } = await listener.start()
 
-  const latestEndpoint = () => runtime.registryEndpoints()
-    .slice()
-    .sort((a, b) => b.updatedAt - a.updatedAt)[0]
+  const latestEndpoint = () => {
+    const compatibilityId = runtime.compatibilityEndpointId()
+    return runtime.registryEndpoints().find((endpoint) => endpoint.endpointId === compatibilityId)
+  }
 
   const registry = Registry({
     peersDir: config.peersDir,
@@ -119,6 +120,7 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
       }
     },
     getEndpoints: runtime.registryEndpoints,
+    getCompatibilityEndpointId: runtime.compatibilityEndpointId,
     transport,
     peerPermissions: config.peerPermissions,
     logger,
@@ -139,6 +141,7 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   })
 
   const sweepReliability = async (): Promise<void> => {
+    if (disposing) return
     try {
       await runtime.sweep()
     } catch (err) {
@@ -152,6 +155,8 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     directory: ctx.directory,
     logger,
   })
+  let disposing = false
+  let disposePromise: Promise<void> | null = null
 
   // Fallback sweep: session.idle is not guaranteed on every version/scenario,
   // so poll idle state periodically as a safety net.
@@ -162,18 +167,22 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
 
   const hooks: Hooks = {
     event: async ({ event }) => {
+      if (disposing) return
       const e = event as { type?: string; properties?: Record<string, unknown> }
       const changed = await runtime.handleEvent(e)
-      if (changed) await registry.heartbeat()
+      if (changed && !disposing) await registry.heartbeat()
+      if (disposing) return
       await permissions.handleEvent(e)
     },
 
     "chat.message": async (input) => {
+      if (disposing) return
       await runtime.noteActivity(input.sessionID)
-      await registry.heartbeat()
+      if (!disposing) await registry.heartbeat()
     },
 
     "command.execute.before": async (input, output) => {
+      if (disposing) return
       if (!COMMAND_NAMES.has(input.command)) return
       await runtime.noteActivity(input.sessionID)
       const queue = runtime.queueForSession(input.sessionID)
@@ -193,6 +202,7 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
               return { name, changed: false }
             },
             selfInstanceId: instanceId,
+            selfEndpointId: runtime.endpointIdForSession(input.sessionID) ?? instanceId,
           },
           input.command,
           input.arguments || ""
@@ -224,16 +234,25 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     },
   })
 
-  hooks.dispose = async () => {
+  hooks.dispose = () => {
+    if (disposePromise) return disposePromise
+    disposing = true
     clearInterval(sweeper)
-    await listener.stop()
-    await registry.stop()
+    const registryStopping = registry.stop()
+    const runtimeStopping = runtime.stop()
+    disposePromise = Promise.all([
+      registryStopping,
+      runtimeStopping,
+      listener.stop(),
+    ]).then(() => undefined)
+    return disposePromise
   }
 
   await logger("info", "opencode-plugin-peers started", {
     instanceId,
     name: currentName,
     inboxUrl,
+    transportUrl,
     policy,
   })
 
@@ -254,6 +273,7 @@ export {
   RateLimiter,
   createProcessMessageQueue,
   createSessionMessageQueue,
+  migrateWorkspaceSpool,
   stableSessionEndpointId,
   stableSpoolEndpointId,
 } from "./queue.js"

@@ -122,6 +122,46 @@ test("/list-agents is an alias of /peers", async () => {
   }
 })
 
+test("/peers excludes the current command session endpoint", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
+  try {
+    const ctx = await makeCtx(dir)
+    const now = Date.now()
+    const entry = (instanceId, name) => ({
+      version: 1,
+      instanceId,
+      name,
+      pid: process.pid,
+      hostname: "localhost",
+      directory: `/tmp/${name}`,
+      serverUrl: "",
+      inboxUrl: "http://127.0.0.1:1",
+      inboxToken: "token",
+      activeSessionId: instanceId,
+      activeSessionTitle: name,
+      busy: false,
+      queuedCount: 0,
+      inboundPolicy: "accept",
+      startedAt: now,
+      heartbeatAt: now,
+      pluginVersion: "0.1.7",
+    })
+    ctx.selfEndpointId = "session-current"
+    ctx.registry.list = async () => [
+      { entry: entry("session-current", "current-session"), alive: true, staleReason: null },
+      { entry: entry("session-other", "other-session"), alive: true, staleReason: null },
+    ]
+
+    const result = await handlePeersCommand(ctx, "peers", "")
+    assert.match(result.message, /Other Opencode sessions \(1\)/)
+    assert.match(result.message, /other-session/)
+    assert.doesNotMatch(result.message, /current-session/)
+    await ctx.registry.stop()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("unknown command passes through", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
   try {
