@@ -13,7 +13,9 @@ Cross-session messaging plugin for opencode: independent instances on the same m
 
 - One registry file per instance in `$XDG_DATA_HOME/opencode-plugin-peers/peers.d/` (0600, atomic write, 10s heartbeat; alive = fresh heartbeat + live PID + `/health` probe).
 - Each instance runs a 127.0.0.1-only inbox listener (random port, bearer token from its registry file). Peers never call each other's opencode server directly.
-- Delivery: queue while busy, flush on `session.idle` (+15s fallback sweep) via own `client.session.promptAsync` — injected messages are ordinary synthetic user messages with no privileges.
+- Delivery: queue while busy, flush on `session.idle` (+15s fallback sweep) via own `client.session.promptAsync` — injected messages are ordinary synthetic user messages (parts carry `metadata.peerMessage: true`).
+- Permissions: the `permission.ask` hook auto-resolves requests whose originating message is a peer-injected one (looked up via `sessionID`+`messageID`), per the `peerPermissions` option (default `"allow"`). Local user turns are never touched.
+- No toast popups: command results go inline via `consumeCommand`; held-message notices use `delivery.notice()` (inline, idle-only); init-time name conflicts are logged only.
 - Plugin options arrive as the **second `Plugin` argument** (tuple form in config), not on `ctx` — keep the dual read in `src/index.ts`.
 - Modules use factory functions, not `class` + `new` (opencode's loader can break `new`).
 - Commands (`/peers*`) are intercepted in `command.execute.before`; the result is written back into the first text part so it also works headless.

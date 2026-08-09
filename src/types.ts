@@ -1,5 +1,7 @@
 export type InboundPolicy = "accept" | "hold" | "refuse"
 
+export type PeerPermissionMode = "allow" | "ask" | "deny"
+
 export interface PeerFrom {
   instanceId: string
   name: string
@@ -18,6 +20,10 @@ export interface PeerEntry {
   inboxToken: string
   activeSessionId: string | null
   activeSessionTitle: string | null
+  /** True while a turn is running in the active session. Optional (v0.1.4+). */
+  busy?: boolean
+  /** Messages queued locally awaiting delivery. Optional (v0.1.4+). */
+  queuedCount?: number
   inboundPolicy: InboundPolicy
   startedAt: number
   heartbeatAt: number
@@ -45,6 +51,14 @@ export interface PluginConfig {
   name?: string
   /** What to do with inbound messages. Default "accept". */
   inboundPolicy?: InboundPolicy
+  /**
+   * How to resolve permission requests raised while acting on a peer
+   * message (a turn started by an injected peer message). Default "allow":
+   * auto-approve so cross-session tasks run unattended. "ask" restores the
+   * default behavior (local user confirms); "deny" blocks tool use in
+   * peer-triggered turns.
+   */
+  peerPermissions?: PeerPermissionMode
   /** Heartbeat interval ms. Default 10_000. */
   heartbeatMs?: number
   /** A peer is stale if its heartbeat is older than this. Default 30_000. */

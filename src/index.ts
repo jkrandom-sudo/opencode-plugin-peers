@@ -9,8 +9,9 @@
  *   - /peers, /peers-name, /peers-inbox commands for the user
  *   - accept/hold/refuse inbound gating
  *   - busy sessions queue messages; delivery happens on session.idle
- *   - messages are ordinary (synthetic) user messages: no privileges,
- *     no shared history, no file transfer
+ *   - messages are ordinary (synthetic) user messages: no shared history,
+ *     no file transfer; permissions in peer-triggered turns are governed
+ *     by the peerPermissions option (default: auto-allow)
  *
  * Architecture: each instance writes a registry file in
  * $XDG_DATA_HOME/opencode-plugin-peers/peers.d/ and runs a 127.0.0.1-only
@@ -29,12 +30,13 @@ import { SessionTracker } from "./session-tracker.js"
 import { Delivery } from "./delivery.js"
 import { Sender } from "./sender.js"
 import { gateMessage } from "./gating.js"
+import { PeerPermissions } from "./permissions.js"
 import { buildPeerTools } from "./tools/peers-tools.js"
 import { handlePeersCommand } from "./commands.js"
-import { consumeCommand, createLogger, errorMessage, showToast } from "./feedback.js"
+import { consumeCommand, createLogger, errorMessage } from "./feedback.js"
 import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 
-const PLUGIN_VERSION = "0.1.3"
+const PLUGIN_VERSION = "0.1.4"
 const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox"])
 
 export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
@@ -82,11 +84,8 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
       if (decision === "hold") {
         const ok = await queue.hold(msg)
         if (!ok) return "full"
-        await showToast(
-          ctx.client,
-          `📥 Held message from "${msg.from.name}" — /peers-inbox to review`,
-          logger
-        )
+        // Fire-and-forget: inbound handling must not block on UX feedback.
+        void delivery.notice(`📥 Held message from "${msg.from.name}" — /peers-inbox to review`)
         return "held"
       }
       if (!queue.enqueue(msg)) return "full"
@@ -113,6 +112,8 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
       inboundPolicy: policy,
       activeSessionId: tracker.activeSessionId(),
       activeSessionTitle: tracker.activeSessionTitle(),
+      busy: tracker.activeSessionId() != null && !tracker.isIdle(),
+      queuedCount: queue.size(),
     }),
     logger,
   })
@@ -120,12 +121,12 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   // Resolve name conflicts before announcing ourselves.
   const unique = uniqueName(currentName, await registry.list())
   if (unique.changed) {
-    // Fire-and-forget: plugin init must never block on UX feedback.
-    void showToast(
-      ctx.client,
-      `📋 Name "${currentName}" was taken; this instance is "${unique.name}".`,
-      logger
-    )
+    // No session exists yet at init, so there is no inline channel — the
+    // final name is visible via /peers.
+    await logger("info", `name "${currentName}" was taken; registered as "${unique.name}"`, {
+      requested: currentName,
+      assigned: unique.name,
+    })
     currentName = unique.name
   }
   await registry.start()
@@ -209,8 +210,13 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
       await logger(message.startsWith("❌") ? "error" : "info", message, {
         command: input.command,
       })
-      await showToast(ctx.client, message, logger)
     },
+
+    "permission.ask": PeerPermissions({
+      client: ctx.client,
+      mode: () => config.peerPermissions,
+      logger,
+    }),
   }
 
   hooks.tool = buildPeerTools({
@@ -253,5 +259,7 @@ export { Delivery, formatMessages } from "./delivery.js"
 export { Sender, buildMessage } from "./sender.js"
 export { InboxListener } from "./listener.js"
 export { gateMessage } from "./gating.js"
+export { PeerPermissions } from "./permissions.js"
+export { formatSessionList, relativeAge } from "./format.js"
 export { resolveConfig, validateName } from "./config.js"
 export * from "./types.js"

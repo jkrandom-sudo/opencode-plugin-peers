@@ -29,7 +29,7 @@ function makeRegistry(peersDir, dynamic, over = {}) {
   })
 }
 
-const dyn = { name: "alpha", inboundPolicy: "accept", activeSessionId: null, activeSessionTitle: null }
+const dyn = { name: "alpha", inboundPolicy: "accept", activeSessionId: null, activeSessionTitle: null, busy: false, queuedCount: 0 }
 
 test("start writes a 0600 entry file with expected fields", async () => {
   const dir = await makeDir()
@@ -60,11 +60,15 @@ test("heartbeat refreshes dynamic fields", async () => {
     await reg.start()
     d.activeSessionId = "ses_1"
     d.activeSessionTitle = "fix bug"
+    d.busy = true
+    d.queuedCount = 3
     await reg.heartbeat()
     const [file] = await readdir(dir)
     const entry = JSON.parse(await readFile(join(dir, file), "utf8"))
     assert.equal(entry.activeSessionId, "ses_1")
     assert.equal(entry.activeSessionTitle, "fix bug")
+    assert.equal(entry.busy, true)
+    assert.equal(entry.queuedCount, 3)
     await reg.stop()
   } finally {
     await rm(dir, { recursive: true, force: true })

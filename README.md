@@ -14,7 +14,8 @@ Run several opencode terminals in parallel (different repos, worktrees, or tasks
 - **accept / hold / refuse** inbound gating
 - Busy sessions queue messages; delivery happens when the session goes idle (plus a 15s fallback sweep)
 - Messages are **plain text only** — no files, no shared conversation history
-- Injected messages are ordinary (synthetic) user messages: they **cannot approve permissions, change config, or run slash commands**
+- **Peer-triggered turns run unattended by default**: permission requests raised while acting on an injected peer message are auto-approved (`peerPermissions`, modeled after Claude Code's permission modes). Your own turns are unaffected
+- Command results and notifications are shown **inline in the session** — no toast popups
 - Local only: everything stays on your machine (127.0.0.1 + file registry), nothing leaves for the cloud
 
 ## Install
@@ -56,6 +57,14 @@ ln -sf "$PWD/dist/index.js" ~/.config/opencode/plugins/opencode-plugin-peers.js
 /peers
 ```
 
+```
+Other Opencode sessions (2):
+  [waiting]  ·  frontend  ·  /Users/you/app/frontend  ·  started 9m ago
+  [idle]  ·  backend  ·  /Users/you/app/backend  ·  started 29m ago
+```
+
+`[waiting]` = a turn is running there (your message queues until it finishes), `[idle]` = ready to receive.
+
 **Let the agent talk:**
 
 ```
@@ -87,6 +96,7 @@ Options can be passed via the tuple form in `opencode.json`:
 | Option | Default | Description |
 |---|---|---|
 | `inboundPolicy` | `"accept"` | `accept` delivers when idle, `hold` parks messages for `/peers-inbox` review, `refuse` rejects them |
+| `peerPermissions` | `"allow"` | Permission requests raised while acting on a peer message: `allow` auto-approves (unattended cross-session work), `ask` restores manual confirmation, `deny` blocks tool use in peer-triggered turns. Never affects your own turns |
 | `name` | directory basename | display name other peers use to address you |
 | `storageDir` | `$XDG_DATA_HOME/opencode-plugin-peers` | where the registry and held inbox live |
 | `heartbeatMs` | `10000` | registry heartbeat interval |
@@ -118,8 +128,8 @@ opencode instance A                        opencode instance B
 ## Security model — read this
 
 - **Same-machine trust**: any process running as your user can read the registry files and therefore talk to your instances' inboxes. The bearer token protects against other users and accidental connections, not against a malicious process with your UID. This matches the trust level of Claude Code's local IPC.
-- **Prompt injection**: a peer message is untrusted input to the model, exactly like text pasted by a user. A compromised or buggy peer could try to talk your agent into doing something dangerous. Use `"hold"` or `"refuse"` for sensitive projects, and keep normal permission prompts enabled.
-- **No privileges by construction**: injected messages cannot approve permissions, change settings, or execute slash commands — they are just text in the conversation.
+- **Prompt injection**: a peer message is untrusted input to the model, exactly like text pasted by a user. A compromised or buggy peer could try to talk your agent into doing something dangerous. With the default `peerPermissions: "allow"`, tool calls made while acting on a peer message are auto-approved — only run peers you trust on the machine, and set `peerPermissions: "ask"` (or `inboundPolicy: "hold"`/`"refuse"`) for sensitive projects.
+- **How auto-allow stays scoped**: the plugin's `permission.ask` hook only resolves requests whose originating user message is one it injected (detected via message metadata). Permission requests from your own typed turns fall through to opencode's normal rules untouched.
 
 ## Limitations
 
