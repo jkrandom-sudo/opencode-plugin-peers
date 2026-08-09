@@ -1,6 +1,6 @@
 {
   "name": "opencode-plugin-peers",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Cross-session messaging for opencode — let independent sessions discover and text each other, modeled after Claude Code's cross-session messaging",
   "type": "module",
   "main": "./dist/index.js",
@@ -14,6 +14,10 @@
     "./server": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
     },
     "./commands/peers.md": "./commands/peers.md",
     "./commands/list-agents.md": "./commands/list-agents.md",
@@ -68,6 +72,9 @@
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.0",
+    "@opentui/core": "^0.4.5",
+    "@opentui/keymap": "^0.4.5",
+    "@opentui/solid": "^0.4.5",
     "@types/node": "^22.0.0",
     "typescript": "^5.4.0"
   },

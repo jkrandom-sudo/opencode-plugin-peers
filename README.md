@@ -16,6 +16,7 @@ Run several opencode terminals in parallel (different repos, worktrees, or tasks
 - Messages are **plain text only** — no files, no shared conversation history
 - **Peer-triggered turns run unattended by default**: permission requests raised while acting on an injected peer message are auto-approved (`peerPermissions`, modeled after Claude Code's permission modes). Your own turns are unaffected
 - Command results and notifications are shown **inline in the session** — no toast popups
+- **Single-Enter slash commands**: with the bundled TUI entry enabled, `/peers` & friends execute on the first Enter instead of inserting text and waiting for a second one (see Install)
 - Local only: everything stays on your machine (127.0.0.1 + file registry), nothing leaves for the cloud
 
 ## Install
@@ -33,6 +34,20 @@ or add to your `opencode.json`:
 ```
 
 Requires opencode >= 1.18.0.
+
+**Single-Enter commands (optional but recommended).** The package ships a TUI entry that makes the plugin's slash commands execute on the first Enter. opencode's TUI loads plugins from `~/.config/opencode/tui.json` (a separate list from `opencode.json`), so add the plugin there too:
+
+```json
+{
+  "plugin": ["opencode-plugin-peers"]
+}
+```
+
+Without this everything still works — the commands just keep opencode's default "first Enter inserts `/name `, second Enter submits" behavior. Notes:
+
+- The autocomplete menu shows two identical `/peers*` rows (the instant-execute entry and the server-defined command). This is cosmetic; the highlighted row is the instant one.
+- Commands typed **with arguments** (e.g. `/peers-name frontend`) are untouched — no autocomplete row matches, so Enter submits normally and the argument is preserved.
+- Older opencode versions ignore the TUI entry entirely and keep the two-Enter behavior.
 
 For local development from a checkout, symlink the built entry into the global plugins directory:
 
