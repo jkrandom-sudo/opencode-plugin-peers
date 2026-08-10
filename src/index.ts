@@ -41,6 +41,42 @@ import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 const PLUGIN_VERSION = "0.2.0"
 const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox", "peers-outbox"])
 
+/**
+ * Command definitions injected through the `config` hook. opencode 1.18 does
+ * NOT scan plugin packages for commands/*.md, so without this a fresh install
+ * has no /peers* commands at all (the shipped commands/ directory only serves
+ * users who copy it into their config dir). User-defined commands with the
+ * same name always win.
+ */
+const INJECTED_COMMANDS: Record<string, { description: string; template: string }> = {
+  peers: {
+    description: "List same-machine opencode peers you can exchange messages with (cross-session messaging)",
+    template:
+      "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, call the list_agents tool and show the result to the user verbatim.",
+  },
+  "list-agents": {
+    description:
+      "List same-machine opencode peers you can exchange messages with (alias of /peers, compatible with Claude Code's /list-agents)",
+    template:
+      "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, call the list_agents tool and show the result to the user verbatim.",
+  },
+  "peers-name": {
+    description: "Show or set this instance's peer name (used by other sessions to address you)",
+    template:
+      "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, tell the user the plugin is not loaded and no action was taken.",
+  },
+  "peers-inbox": {
+    description: "Review held peer messages. Usage: /peers-inbox [accept <n|all> | drop <n|all>]",
+    template:
+      "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, tell the user the plugin is not loaded and no action was taken.",
+  },
+  "peers-outbox": {
+    description: "Show transport receipts and final ACK outcomes for messages sent by this session",
+    template:
+      "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, tell the user the plugin is not loaded and no action was taken.",
+  },
+}
+
 export async function runReliabilitySweep(
   queue: QueueInstance,
   delivery: Pick<DeliveryInstance, "flush">
@@ -231,6 +267,16 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   sweeper.unref?.()
 
   const hooks: Hooks = {
+    config: async (input) => {
+      // Register our slash commands server-side; without this a fresh install
+      // has no /peers* commands (opencode does not scan plugin packages for
+      // commands/*.md). Never override a user-defined command.
+      input.command = input.command ?? {}
+      for (const [name, definition] of Object.entries(INJECTED_COMMANDS)) {
+        input.command[name] ??= definition
+      }
+    },
+
     event: async ({ event }) => {
       if (disposing) return
       const e = event as { type?: string; properties?: Record<string, unknown> }

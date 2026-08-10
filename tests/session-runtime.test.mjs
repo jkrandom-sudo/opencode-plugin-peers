@@ -494,3 +494,39 @@ test("whenReady resolves after the first initialize settles and on stop", async 
     await rm(storageDir, { recursive: true, force: true })
   }
 })
+
+test("config hook injects the five slash commands without overriding user definitions", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peers-config-hook-"))
+  let hooks
+  try {
+    const client = fakeClient()
+    client.app = { log: async () => ({ data: true }) }
+    hooks = await PeersPlugin({
+      client,
+      directory: "/workspace/project",
+      worktree: "/workspace/project",
+      project: { id: "project-1" },
+      serverUrl: new URL("http://127.0.0.1:4096"),
+    }, {
+      storageDir,
+      heartbeatMs: 60_000,
+      sweepMs: 60_000,
+    })
+    const config = {}
+    await hooks.config(config)
+    assert.deepEqual(Object.keys(config.command).sort(), [
+      "list-agents", "peers", "peers-inbox", "peers-name", "peers-outbox",
+    ])
+    for (const definition of Object.values(config.command)) {
+      assert.ok(definition.description)
+      assert.ok(definition.template.includes("$ARGUMENTS"))
+    }
+    // user-defined commands win
+    const custom = { command: { peers: { template: "custom", description: "user override" } } }
+    await hooks.config(custom)
+    assert.equal(custom.command.peers.template, "custom")
+  } finally {
+    await hooks?.dispose?.()
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})
