@@ -82,15 +82,41 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     maxMessageBytes: config.maxMessageBytes,
     maxMessageAgeMs: config.maxMessageAgeMs,
     processId: instanceId,
-    resolveEndpoint: ({ version, toEndpointId }) => {
-      if (version === 1) return runtime.compatibilityEndpointId()
-      return toEndpointId && runtime.hasEndpoint(toEndpointId) ? toEndpointId : null
+    resolveEndpoint: async ({ version, toEndpointId }) => {
+      const resolve = () =>
+        version === 1
+          ? runtime.compatibilityEndpointId()
+          : toEndpointId && runtime.hasEndpoint(toEndpointId)
+            ? toEndpointId
+            : null
+      const immediate = resolve()
+      if (immediate) return immediate
+      // Startup window: the listener is up before deferred session discovery
+      // finishes. Wait (bounded) for it instead of returning a terminal 404
+      // for an endpoint that exists moments later.
+      let timeout: ReturnType<typeof setTimeout> | null = null
+      try {
+        await Promise.race([
+          runtime.whenReady(),
+          new Promise<void>((res) => {
+            timeout = setTimeout(res, 10_000)
+            timeout.unref?.()
+          }),
+        ])
+      } finally {
+        if (timeout) clearTimeout(timeout)
+      }
+      return resolve()
     },
     logger,
     onMessage: async (msg, endpointId): Promise<ReceiveStatus> => {
       if (!recvLimit(msg.from.instanceId)) return "full"
       const status = await runtime.receive(msg, endpointId!, policy)
-      void dispatchAcknowledgements()
+      // Fire-and-forget, but never let a rejection escape: an unhandled
+      // rejection would crash the host opencode process.
+      void dispatchAcknowledgements().catch((err) =>
+        logger("warn", "acknowledgement dispatch failed; will retry", { error: String(err) })
+      )
       return status
     },
     onAcknowledgement: async (acknowledgement) => {

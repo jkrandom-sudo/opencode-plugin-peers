@@ -201,3 +201,50 @@ test("deny mode still rejects a protected peer permission", async () => {
   await inst.handleEvent(askedEvent({ permission: "edit", patterns: ["AGENTS.md"] }))
   assert.equal(replies[0].body.response, "reject")
 })
+
+test("temporarily invisible messages are not cached as local turns", async () => {
+  const calls = []
+  const replies = []
+  let visible = false
+  const client = {
+    session: {
+      message: async (args) => {
+        calls.push(args)
+        if (!visible) return { data: undefined, error: { status: 404 } }
+        const m = peerTurnMessages[args.path.messageID]
+        return { data: { info: { role: m.role, parentID: m.parentID }, parts: m.parts } }
+      },
+    },
+    postSessionIdPermissionsPermissionId: async (args) => {
+      replies.push(args)
+      return { data: true }
+    },
+  }
+  const inst = PeerPermissions({
+    client,
+    mode: () => "allow",
+    directory: "/tmp/x",
+    logger: noopLogger,
+  })
+  await inst.handleEvent(askedEvent())
+  assert.equal(replies.length, 0) // message not visible yet: no reply, no cache
+  visible = true
+  await inst.handleEvent(askedEvent())
+  assert.equal(replies.length, 1) // re-evaluated: the peer turn is now auto-approved
+})
+
+for (const [label, properties] of [
+  ["shell rc files", { permission: "edit", patterns: ["~/.zshrc"] }],
+  ["git credentials config", { permission: "write", patterns: ["~/.gitconfig"] }],
+  ["netrc", { permission: "write", patterns: ["~/.netrc"] }],
+  ["kube config", { permission: "edit", patterns: ["~/.kube/config"] }],
+  ["docker config", { permission: "edit", patterns: ["~/.docker/config.json"] }],
+  ["launch agents", { permission: "write", patterns: ["~/Library/LaunchAgents/com.evil.plist"] }],
+  ["crontab", { permission: "bash", patterns: ["crontab -e"] }],
+]) {
+  test(`allow mode never auto-approves ${label}`, async () => {
+    const { inst, replies } = make()
+    await inst.handleEvent(askedEvent(properties))
+    assert.equal(replies.length, 0)
+  })
+}

@@ -454,3 +454,43 @@ test("plugin disposal waits for an in-flight event and never republishes registr
     await rm(storageDir, { recursive: true, force: true })
   }
 })
+
+test("whenReady resolves after the first initialize settles and on stop", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peers-session-ready-"))
+  try {
+    const runtime = SessionRuntime({
+      client: fakeClient(),
+      config: resolveConfig({ storageDir }),
+      directory: "/workspace/project",
+      name: () => "project",
+      logger: noopLogger,
+    })
+    let ready = false
+    const waiting = runtime.whenReady().then(() => {
+      ready = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(ready, false) // initialize has not run yet
+    await runtime.initialize()
+    await waiting
+    assert.equal(ready, true)
+
+    // a never-initialized runtime still releases waiters on stop
+    const fresh = SessionRuntime({
+      client: fakeClient(),
+      config: resolveConfig({ storageDir }),
+      directory: "/workspace/project",
+      name: () => "project",
+      logger: noopLogger,
+    })
+    let freshReady = false
+    const freshWaiting = fresh.whenReady().then(() => {
+      freshReady = true
+    })
+    await fresh.stop()
+    await freshWaiting
+    assert.equal(freshReady, true)
+  } finally {
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})

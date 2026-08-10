@@ -34,7 +34,7 @@ export interface ListenerOptions {
   runtimeDir?: string
   processId?: string
   platform?: NodeJS.Platform
-  resolveEndpoint?: (route: MessageRoute) => string | null
+  resolveEndpoint?: (route: MessageRoute) => string | null | Promise<string | null>
   onMessage: (msg: InboundMessage, endpointId?: string) => Promise<ReceiveStatus>
   onAcknowledgement?: (ack: PeerAcknowledgementV2) => Promise<void>
   logger: Logger
@@ -218,7 +218,7 @@ export function InboxListener(opts: ListenerOptions): ListenerInstance {
     }
 
     try {
-      const endpointId = opts.resolveEndpoint?.(envelope.route)
+      const endpointId = await opts.resolveEndpoint?.(envelope.route)
       if (opts.resolveEndpoint && !endpointId) {
         send(404, { error: "endpoint not found" })
         return

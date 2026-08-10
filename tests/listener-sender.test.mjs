@@ -235,3 +235,45 @@ test("sender reports offline peer", async () => {
   assert.equal(result.ok, false)
   assert.match(result.error, /offline|unreachable/i)
 })
+
+test("listener awaits an async resolveEndpoint before routing", async () => {
+  const received = []
+  const { listener, url } = await startListener(
+    async (message, endpointId) => {
+      received.push({ message, endpointId })
+      return "queued"
+    },
+    {
+      resolveEndpoint: async ({ toEndpointId }) => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        return toEndpointId === "ep-known" ? "ep-known" : null
+      },
+    }
+  )
+  try {
+    const v2 = (toEndpointId) => ({
+      version: 2,
+      messageId: `m-${toEndpointId}`,
+      fromEndpointId: "ep-sender",
+      toEndpointId,
+      from: { instanceId: "ep-sender", name: "sender", directory: "/tmp/s" },
+      text: "hi",
+      via: ["ep-sender"],
+      sentAt: Date.now(),
+    })
+    const post = (body) =>
+      fetch(`${url}/message`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer secret" },
+        body: JSON.stringify(body),
+      })
+    const known = await post(v2("ep-known"))
+    assert.equal(known.status, 202)
+    assert.equal(received[0].endpointId, "ep-known")
+    const unknown = await post(v2("ep-gone"))
+    assert.equal(unknown.status, 404)
+    assert.equal(received.length, 1)
+  } finally {
+    await listener.stop()
+  }
+})

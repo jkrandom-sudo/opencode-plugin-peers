@@ -22,6 +22,13 @@ export interface DeliveryOptions {
   logger: Logger
   /** Protocol-v2 delivery targets this session immediately, even while busy. */
   immediate?: boolean
+  /**
+   * Max time one prompt injection may take before it is treated as a delivery
+   * failure and the message is requeued. Without this bound a hung
+   * promptAsync would wedge the serialized delivery chain and dispose().
+   * Default 30s.
+   */
+  injectTimeoutMs?: number
 }
 
 export interface DeliveryInstance {
@@ -64,8 +71,24 @@ export function deterministicPeerMessageId(sessionId: string, message: InboundMe
   return `msg_${digest.slice(0, 26)}`
 }
 
+const DEFAULT_INJECT_TIMEOUT_MS = 30_000
+
 export function Delivery(opts: DeliveryOptions): DeliveryInstance {
   let flushing = false
+  const injectTimeoutMs = opts.injectTimeoutMs ?? DEFAULT_INJECT_TIMEOUT_MS
+
+  /** Race an SDK call against a timeout; on expiry the call is abandoned and treated as a failure. */
+  function withTimeout<T>(call: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const expiry = new Promise<never>((_, reject) => {
+      // Deliberately NOT unref'd: when the SDK call genuinely hangs this timer
+      // may be the only thing that can unblock the delivery chain.
+      timer = setTimeout(() => reject(new Error(`prompt injection timed out after ${injectTimeoutMs}ms`)), injectTimeoutMs)
+    })
+    return Promise.race([call, expiry]).finally(() => {
+      if (timer) clearTimeout(timer)
+    })
+  }
 
   function assertPromptSucceeded(result: unknown): void {
     const sdkResult = result as {
@@ -96,20 +119,20 @@ export function Delivery(opts: DeliveryOptions): DeliveryInstance {
     const messageID = message ? deterministicPeerMessageId(sessionId, message) : undefined
     const session = opts.client.session as unknown as Record<string, unknown>
     if (typeof session.promptAsync === "function") {
-      const result = await (session.promptAsync as (a: unknown) => Promise<unknown>)({
+      const result = await withTimeout((session.promptAsync as (a: unknown) => Promise<unknown>)({
         path: { id: sessionId },
         body: { ...(messageID ? { messageID } : {}), parts: [part] },
         query: { directory: opts.directory },
         throwOnError: true,
-      })
+      }))
       assertPromptSucceeded(result)
       return
     }
-    const result = await opts.client.session.prompt({
+    const result = await withTimeout(opts.client.session.prompt({
       path: { id: sessionId },
       body: { ...(messageID ? { messageID } : {}), parts: [part] },
       query: { directory: opts.directory },
-    })
+    }))
     assertPromptSucceeded(result)
   }
 

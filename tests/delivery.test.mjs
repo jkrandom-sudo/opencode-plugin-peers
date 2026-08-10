@@ -259,3 +259,41 @@ test("formatMessages escapes nothing but structures blocks", () => {
   assert.match(out, /sender endpoint: aaaa1111/)
   assert.ok(out.endsWith('the sender\'s exact endpoint ID "aaaa1111".'))
 })
+
+test("a hung promptAsync is abandoned after injectTimeoutMs and the message requeues", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-delivery-"))
+  let releaseHung = () => {}
+  try {
+    const tracker = SessionTracker()
+    tracker.noteUserActivity("ses_1")
+    const queue = await makeQueue(dir)
+    queue.enqueue(msg("hung"))
+    const hung = new Promise((_, reject) => {
+      releaseHung = reject
+    })
+    hung.catch(() => {}) // released only at test teardown
+    const client = {
+      session: {
+        promptAsync: () => hung, // never settles on its own
+      },
+    }
+    const delivery = Delivery({
+      client,
+      tracker,
+      queue,
+      directory: "/tmp/a",
+      logger: noopLogger,
+      immediate: true,
+      injectTimeoutMs: 50,
+    })
+    assert.equal(await delivery.flush(), false)
+    assert.deepEqual(queue.pending().map((message) => message.id), ["hung"])
+    assert.equal((await readdir(join(dir, "spool", "legacy", "inflight"))).length, 0)
+    assert.equal((await readdir(join(dir, "spool", "legacy", "queued"))).length, 1)
+    // the serialized chain is not wedged: a later flush runs again
+    assert.equal(await delivery.flush(), false)
+  } finally {
+    releaseHung(new Error("test teardown"))
+    await rm(dir, { recursive: true, force: true })
+  }
+})

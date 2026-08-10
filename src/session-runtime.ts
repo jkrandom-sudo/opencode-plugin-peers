@@ -42,6 +42,8 @@ export interface SessionRuntimeOptions {
 
 export interface SessionRuntimeInstance {
   initialize: () => Promise<void>
+  /** Resolves once the first initialize() attempt has settled (never rejects). */
+  whenReady: () => Promise<void>
   stop: () => Promise<void>
   registryEndpoints: () => RegistryEndpoint[]
   compatibilityEndpointId: () => string | null
@@ -70,6 +72,8 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
   const pendingOperations = new Set<Promise<unknown>>()
   let lifecycle: "running" | "stopping" | "stopped" = "running"
   let stopPromise: Promise<void> | null = null
+  let readyPromise: Promise<void> | null = null
+  let markReady: () => void = () => {}
 
   function whileRunning<T>(fallback: T, operation: () => Promise<T>): Promise<T> {
     if (lifecycle !== "running") return Promise.resolve(fallback)
@@ -175,6 +179,11 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
 
   return {
     initialize() {
+      if (!readyPromise) {
+        readyPromise = new Promise<void>((resolve) => {
+          markReady = resolve
+        })
+      }
       return whileRunning(undefined, async () => {
         const [listedResponse, statusResponse] = await Promise.all([
           opts.client.session.list({ query: { directory: opts.directory } }),
@@ -200,12 +209,24 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
           await upsert(session, normalizeStatus(statuses[session.id]))
         }
         for (const session of sessions) await loadChildren(session, statuses)
-      })
+      }).finally(() => markReady())
+    },
+
+    whenReady() {
+      // Ready means "the first discovery pass has settled". Never rejects;
+      // callers should bound their wait if a hang would be a problem.
+      if (!readyPromise) {
+        readyPromise = new Promise<void>((resolve) => {
+          markReady = resolve
+        })
+      }
+      return readyPromise
     },
 
     stop() {
       if (stopPromise) return stopPromise
       lifecycle = "stopping"
+      markReady() // release whenReady waiters; no discovery will happen now
       stopPromise = (async () => {
         await Promise.allSettled([...pendingOperations])
         lifecycle = "stopped"
