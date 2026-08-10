@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, rename, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { resolveConfig } from "../dist/config.js"
-import { MessageQueue, stableSessionEndpointId, stableSpoolEndpointId } from "../dist/queue.js"
+import { MessageQueue, createSessionMessageQueue, stableSessionEndpointId, stableSpoolEndpointId } from "../dist/queue.js"
 import { SessionRuntime } from "../dist/session-runtime.js"
 import { PeersPlugin } from "../dist/index.js"
 import { Sender } from "../dist/sender.js"
@@ -34,7 +34,9 @@ function fakeClient() {
     childCalls,
     session: {
       list: async () => ({ data: [sessions.get("ses_one"), sessions.get("ses_two")] }),
-      status: async () => ({ data: { ses_one: { type: "idle" }, ses_two: { type: "busy" } } }),
+      // A real server only keeps NON-IDLE sessions in the status snapshot
+      // (SessionStatus.set deletes idle entries).
+      status: async () => ({ data: { ses_two: { type: "busy" } } }),
       children: async ({ path }) => {
         childCalls.push(path.id)
         return { data: path.id === "ses_one" ? [sessions.get("ses_child")] : [] }
@@ -56,7 +58,7 @@ const message = (id, text = id) => ({
   sentAt: Date.now(),
 })
 
-test("session runtime discovers children and delivers exact busy-session messages immediately", async () => {
+test("session runtime adopts only live sessions at startup, then discovers by events", async () => {
   const storageDir = await mkdtemp(join(tmpdir(), "peers-session-runtime-"))
   try {
     const client = fakeClient()
@@ -69,11 +71,25 @@ test("session runtime discovers children and delivers exact busy-session message
     })
     await runtime.initialize()
 
-    const endpoints = runtime.registryEndpoints()
+    // Startup: only the busy session from the status snapshot is adopted.
+    // Historical idle sessions from session.list() are NOT published.
+    let endpoints = runtime.registryEndpoints()
+    assert.deepEqual(endpoints.map((entry) => entry.sessionId), ["ses_two"])
+
+    // Event-driven adoption: an update adopts a historical session...
+    await runtime.handleEvent({
+      type: "session.updated",
+      properties: { info: session("ses_one") },
+    })
+    // ...and creating a session also discovers its children.
+    await runtime.handleEvent({
+      type: "session.created",
+      properties: { info: session("ses_child", { parentID: "ses_one", time: { created: 150, updated: 250 } }) },
+    })
+    endpoints = runtime.registryEndpoints()
     assert.equal(endpoints.length, 3)
     assert.equal(new Set(endpoints.map((entry) => entry.endpointId)).size, 3)
     assert.ok(endpoints.every((entry) => entry.name === "project"))
-    assert.ok(client.childCalls.includes("ses_one"))
     assert.ok(endpoints.some((entry) => entry.sessionId === "ses_child" && entry.parentSessionId === "ses_one"))
 
     const targetId = stableSessionEndpointId("ses_two")
@@ -101,6 +117,8 @@ test("session runtime discovers children and delivers exact busy-session message
 
     await runtime.handleEvent({ type: "session.deleted", properties: { info: session("ses_one") } })
     assert.ok(!runtime.registryEndpoints().some((entry) => entry.sessionId === "ses_one"))
+    // the cascade removes the child too
+    assert.ok(!runtime.registryEndpoints().some((entry) => entry.sessionId === "ses_child"))
   } finally {
     await rm(storageDir, { recursive: true, force: true })
   }
@@ -125,6 +143,12 @@ test("plugin exposes same-process sessions and uses tool context sessionID as se
       sweepMs: 60_000,
     })
 
+    // Only the startup-busy session (ses_two) is adopted by deferred
+    // discovery. The others join through real activity, as in production:
+    // a user message adopts ses_one; a created event adopts the child.
+    await hooks["chat.message"]({ sessionID: "ses_one" })
+    await hooks.event({ event: { type: "session.created", properties: { info: session("ses_child", { parentID: "ses_one", time: { created: 150, updated: 250 } }) } } })
+
     for (let attempt = 0; attempt < 50; attempt++) {
       const files = await readdir(join(storageDir, "peers.d"))
       if (files.filter((file) => file.endsWith(".v2.json")).length === 3) break
@@ -138,19 +162,24 @@ test("plugin exposes same-process sessions and uses tool context sessionID as se
     assert.equal(entries.filter((entry) => entry.version === 1).length, 1)
     const compatibility = entries.find((entry) => entry.version === 1)
     assert.match(compatibility.inboxUrl, /^http:\/\/127\.0\.0\.1:\d+$/)
-    assert.equal(compatibility.activeSessionId, "ses_two")
+    // ses_one is the most recently active root (chat.message above)
+    assert.equal(compatibility.activeSessionId, "ses_one")
     const legacyResult = await Sender({
       self: { instanceId: "legacy-process", name: "legacy", directory: "/workspace/legacy" },
     }).send(compatibility, "old-to-new through published registry")
     assert.deepEqual(legacyResult, { ok: true, status: "delivered" })
-    assert.equal(client.prompts.at(-1).path.id, "ses_two")
+    assert.equal(client.prompts.at(-1).path.id, "ses_one")
 
     const senderId = stableSessionEndpointId("ses_one")
     const targetId = stableSessionEndpointId("ses_two")
     const context = { sessionID: "ses_one" }
     const listing = await hooks.tool.list_agents.execute({}, context)
-    assert.match(listing, new RegExp(targetId.slice(0, 12)))
+    // list_agents collapses to one row per process; ses_one/ses_two/ses_child
+    // are all the same process, so only one endpoint id appears (not senderId
+    // since that is the self endpoint filtered out).
     assert.doesNotMatch(listing, new RegExp(`- .*${senderId}`))
+    // send_message targeting by exact endpoint id still resolves to the
+    // full (un-collapsed) registry — tested below.
 
     const ambiguous = await hooks.tool.send_message.execute({ to: "same-process", message: "hello" }, context)
     assert.match(ambiguous, /ambiguous/)
@@ -317,7 +346,7 @@ test("workspace spool migration resumes partial moves and quarantines visible co
   }
 })
 
-test("recursive children inherit startup status, tolerate cycles, and delete as a cascade", async () => {
+test("startup adopts busy children directly from the status snapshot; deletes cascade", async () => {
   const storageDir = await mkdtemp(join(tmpdir(), "peers-session-children-"))
   try {
     const root = session("ses_root", { title: "root", time: { created: 100, updated: 400 } })
@@ -337,8 +366,9 @@ test("recursive children inherit startup status, tolerate cycles, and delete as 
     const client = {
       session: {
         list: async () => ({ data: [root] }),
+        // The snapshot is the only startup adoption signal: it holds every
+        // non-idle session, including children of idle roots.
         status: async () => ({ data: {
-          [root.id]: { type: "idle" },
           [child.id]: { type: "busy" },
           [grandchild.id]: { type: "retry" },
         } }),
@@ -361,14 +391,18 @@ test("recursive children inherit startup status, tolerate cycles, and delete as 
     })
     await runtime.initialize()
 
-    assert.equal(runtime.registryEndpoints().length, 3)
+    // The idle root is historical and NOT adopted; busy/retry descendants are.
+    assert.deepEqual(
+      runtime.registryEndpoints().map((entry) => entry.sessionId).sort(),
+      [child.id, grandchild.id].sort(),
+    )
     assert.equal(runtime.registryEndpoints().find((entry) => entry.sessionId === child.id).status, "busy")
     assert.equal(runtime.registryEndpoints().find((entry) => entry.sessionId === grandchild.id).status, "retry")
-    assert.deepEqual(childCalls, [root.id, child.id, grandchild.id])
     assert.equal(await runtime.receive(message("busy-child"), stableSessionEndpointId(child.id), "accept"), "delivered")
     assert.equal(await runtime.receive(message("retry-child"), stableSessionEndpointId(grandchild.id), "accept"), "delivered")
     assert.deepEqual(prompts.map((call) => call.path.id), [child.id, grandchild.id])
 
+    // deleting the (unadopted) root still cascades to its adopted descendants
     await runtime.handleEvent({ type: "session.deleted", properties: { info: root } })
     assert.deepEqual(runtime.registryEndpoints(), [])
   } finally {
@@ -527,6 +561,34 @@ test("config hook injects the five slash commands without overriding user defini
     assert.equal(custom.command.peers.template, "custom")
   } finally {
     await hooks?.dispose?.()
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})
+
+test("startup adopts an idle session that holds undelivered spool records", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peers-session-spool-"))
+  try {
+    // seed a queued spool record for ses_one (idle in the status snapshot)
+    const queue = createSessionMessageQueue({
+      config: resolveConfig({ storageDir }),
+      sessionId: "ses_one",
+      logger: noopLogger,
+    })
+    queue.enqueue(message("pending-restart"))
+    const client = fakeClient()
+    const runtime = SessionRuntime({
+      client,
+      config: resolveConfig({ storageDir }),
+      directory: "/workspace/project",
+      name: () => "project",
+      logger: noopLogger,
+    })
+    await runtime.initialize()
+    const adopted = runtime.registryEndpoints().map((entry) => entry.sessionId).sort()
+    assert.deepEqual(adopted, ["ses_one", "ses_two"]) // spool holder + busy snapshot
+    // ...and the queued message is delivered without waiting for any event
+    assert.ok(client.prompts.some((call) => call.path.id === "ses_one"))
+  } finally {
     await rm(storageDir, { recursive: true, force: true })
   }
 })
