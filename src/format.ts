@@ -34,6 +34,31 @@ function entryKey(peer: ListedPeer): string {
   return peer.entry.version === 2 ? peer.entry.endpointId : peer.entry.instanceId
 }
 
+/** The process identifier — v2 entries share a processId, v1 entries use instanceId. */
+function processKey(peer: ListedPeer): string {
+  return peer.entry.version === 2 ? peer.entry.processId : peer.entry.instanceId
+}
+
+/**
+ * Collapse multiple session endpoints of the same process into one display
+ * row — the most recently active session. opencode persists every session
+ * a directory ever had and replays their events at startup, so per-session
+ * rows would flood /peers with historical sessions. One row per running
+ * process matches Claude Code's instance list. Routing (send_message) still
+ * targets individual endpoint IDs from the full registry.
+ */
+export function collapseToProcesses<T extends ListedPeer>(peers: T[]): T[] {
+  const byProcess = new Map<string, T>()
+  for (const peer of peers) {
+    const key = processKey(peer)
+    const current = byProcess.get(key)
+    if (!current || peer.entry.startedAt > current.entry.startedAt) {
+      byProcess.set(key, peer)
+    }
+  }
+  return [...byProcess.values()]
+}
+
 /**
  * Deterministic display order. The registry rewrites entries with atomic
  * renames every heartbeat, so readdir order shuffles constantly — sorting
@@ -46,7 +71,7 @@ export function sortPeers<T extends ListedPeer>(peers: T[]): T[] {
 }
 
 export function formatSessionList(peers: ListedPeer[], now: number): string {
-  const online = sortPeers(peers.filter((p) => p.alive))
+  const online = sortPeers(collapseToProcesses(peers.filter((p) => p.alive)))
   const offline = peers.filter((p) => !p.alive)
   const lines: string[] = []
 

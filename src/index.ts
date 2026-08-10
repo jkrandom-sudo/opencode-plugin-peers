@@ -424,6 +424,6 @@ export type {
 export { gateMessage } from "./gating.js"
 export { PeerPermissions, isProtectedPermission } from "./permissions.js"
 export { Outbox } from "./outbox.js"
-export { formatSessionList, relativeAge } from "./format.js"
+export { collapseToProcesses, formatSessionList, relativeAge, sortPeers } from "./format.js"
 export { resolveConfig, validateName } from "./config.js"
 export * from "./types.js"

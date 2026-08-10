@@ -10,7 +10,7 @@ import type { ListedPeer, RegistryInstance } from "../registry.js"
 import type { Sender } from "../sender.js"
 import type { RateLimiter } from "../queue.js"
 import type { OutboxInstance } from "../outbox.js"
-import { sortPeers } from "../format.js"
+import { collapseToProcesses, sortPeers } from "../format.js"
 
 export interface ToolsDeps {
   registry: RegistryInstance
@@ -32,8 +32,8 @@ function isEndpointShaped(target: string): boolean {
 }
 
 export function formatPeerList(peers: ListedPeer[], selfName: string, selfId: string): string {
-  const online = sortPeers(peers.filter((p) => p.alive))
-  const offline = sortPeers(peers.filter((p) => !p.alive))
+  const online = sortPeers(collapseToProcesses(peers.filter((p) => p.alive)))
+  const offline = sortPeers(collapseToProcesses(peers.filter((p) => !p.alive)))
   const lines: string[] = []
   if (online.length === 0) {
     lines.push("No peers online.")

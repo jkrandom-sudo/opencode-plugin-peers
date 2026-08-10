@@ -174,8 +174,12 @@ test("plugin exposes same-process sessions and uses tool context sessionID as se
     const targetId = stableSessionEndpointId("ses_two")
     const context = { sessionID: "ses_one" }
     const listing = await hooks.tool.list_agents.execute({}, context)
-    assert.match(listing, new RegExp(targetId.slice(0, 12)))
+    // list_agents collapses to one row per process; ses_one/ses_two/ses_child
+    // are all the same process, so only one endpoint id appears (not senderId
+    // since that is the self endpoint filtered out).
     assert.doesNotMatch(listing, new RegExp(`- .*${senderId}`))
+    // send_message targeting by exact endpoint id still resolves to the
+    // full (un-collapsed) registry — tested below.
 
     const ambiguous = await hooks.tool.send_message.execute({ to: "same-process", message: "hello" }, context)
     assert.match(ambiguous, /ambiguous/)

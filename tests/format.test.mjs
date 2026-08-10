@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { formatSessionList, relativeAge } from "../dist/format.js"
+import { formatSessionList, relativeAge, collapseToProcesses } from "../dist/format.js"
 
 const NOW = 1_800_000_000_000
 
@@ -106,4 +106,17 @@ test("formatSessionList sorts online rows deterministically regardless of input 
   const positions = order.map((name) => one.indexOf(`  [idle]  ·  ${name}`))
   assert.ok(positions.every((pos) => pos > 0), one)
   assert.deepEqual([...positions].sort((x, y) => x - y), positions)
+})
+
+test("collapseToProcesses keeps one row per process (newest session)", () => {
+  const proc = (endpointId, startedAt) => peer({}, { version: 2, endpointId, processId: "proc-a", startedAt })
+  const other = (endpointId, startedAt) => peer({}, { version: 2, endpointId, processId: "proc-b", startedAt })
+  
+  const collapsed = collapseToProcesses([
+    proc("ep-old", NOW - 9000),
+    other("ep-other", NOW - 3000),
+    proc("ep-new", NOW - 1000),
+  ])
+  assert.equal(collapsed.length, 2)
+  assert.deepEqual(collapsed.map((p) => p.entry.endpointId).sort(), ["ep-new", "ep-other"])
 })
