@@ -70,6 +70,40 @@ test("peer-triggered turn gets an automatic 'once' reply", async () => {
   assert.deepEqual(calls.map((c) => c.path.messageID), ["asst_1", "user_1"])
 })
 
+test("structured peer-message provenance follows the source message parent chain", async () => {
+  const calls = []
+  const replies = []
+  const messages = {
+    asst_1: { role: "assistant", parentID: "user_1", parts: [] },
+    user_1: {
+      role: "user",
+      parts: [{
+        type: "text",
+        text: "peer input",
+        metadata: {
+          peerMessage: {
+            version: 2,
+            messageId: "peer-1",
+            fromEndpointId: "session-alpha",
+            toSessionId: "ses_1",
+          },
+        },
+      }],
+    },
+  }
+  const inst = PeerPermissions({
+    client: makeClient({ messages, calls, replies }),
+    mode: () => "allow",
+    directory: "/tmp/x",
+    logger: noopLogger,
+  })
+
+  await inst.handleEvent(askedEvent())
+  assert.equal(replies.length, 1)
+  assert.equal(replies[0].body.response, "once")
+  assert.deepEqual(calls.map((call) => call.path.messageID), ["asst_1", "user_1"])
+})
+
 test("deny mode auto-rejects peer-turn permissions", async () => {
   const { inst, replies } = make({ mode: () => "deny" })
   await inst.handleEvent(askedEvent())
@@ -146,3 +180,71 @@ test("turn verdicts are cached per originating messageID", async () => {
   // asst_1 turn resolved once (2 fetches); per_2 hit the cache
   assert.equal(calls.length, 2)
 })
+
+for (const [label, properties] of [
+  ["OpenCode permission configuration", { permission: "edit", patterns: ["opencode.json"] }],
+  ["plugin permission configuration", { permission: "write", patterns: [".opencode/plugins/peers.json"] }],
+  ["AGENTS.md", { permission: "edit", patterns: ["AGENTS.md"] }],
+  ["credentials", { permission: "read", patterns: ["~/.aws/credentials"] }],
+  ["secrets", { permission: "read", patterns: [".env.production"] }],
+  ["permission escalation", { permission: "permission", patterns: ["bash:*"], metadata: { escalation: true } }],
+]) {
+  test(`allow mode never auto-approves ${label}`, async () => {
+    const { inst, replies } = make()
+    await inst.handleEvent(askedEvent(properties))
+    assert.equal(replies.length, 0)
+  })
+}
+
+test("deny mode still rejects a protected peer permission", async () => {
+  const { inst, replies } = make({ mode: () => "deny" })
+  await inst.handleEvent(askedEvent({ permission: "edit", patterns: ["AGENTS.md"] }))
+  assert.equal(replies[0].body.response, "reject")
+})
+
+test("temporarily invisible messages are not cached as local turns", async () => {
+  const calls = []
+  const replies = []
+  let visible = false
+  const client = {
+    session: {
+      message: async (args) => {
+        calls.push(args)
+        if (!visible) return { data: undefined, error: { status: 404 } }
+        const m = peerTurnMessages[args.path.messageID]
+        return { data: { info: { role: m.role, parentID: m.parentID }, parts: m.parts } }
+      },
+    },
+    postSessionIdPermissionsPermissionId: async (args) => {
+      replies.push(args)
+      return { data: true }
+    },
+  }
+  const inst = PeerPermissions({
+    client,
+    mode: () => "allow",
+    directory: "/tmp/x",
+    logger: noopLogger,
+  })
+  await inst.handleEvent(askedEvent())
+  assert.equal(replies.length, 0) // message not visible yet: no reply, no cache
+  visible = true
+  await inst.handleEvent(askedEvent())
+  assert.equal(replies.length, 1) // re-evaluated: the peer turn is now auto-approved
+})
+
+for (const [label, properties] of [
+  ["shell rc files", { permission: "edit", patterns: ["~/.zshrc"] }],
+  ["git credentials config", { permission: "write", patterns: ["~/.gitconfig"] }],
+  ["netrc", { permission: "write", patterns: ["~/.netrc"] }],
+  ["kube config", { permission: "edit", patterns: ["~/.kube/config"] }],
+  ["docker config", { permission: "edit", patterns: ["~/.docker/config.json"] }],
+  ["launch agents", { permission: "write", patterns: ["~/Library/LaunchAgents/com.evil.plist"] }],
+  ["crontab", { permission: "bash", patterns: ["crontab -e"] }],
+]) {
+  test(`allow mode never auto-approves ${label}`, async () => {
+    const { inst, replies } = make()
+    await inst.handleEvent(askedEvent(properties))
+    assert.equal(replies.length, 0)
+  })
+}

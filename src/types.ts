@@ -1,4 +1,4 @@
-export type InboundPolicy = "accept" | "hold" | "refuse"
+export type InboundPolicy = "accept" | "auto" | "hold" | "refuse"
 
 export type PeerPermissionMode = "allow" | "ask" | "deny"
 
@@ -30,7 +30,49 @@ export interface PeerEntry {
   pluginVersion: string
 }
 
-export interface InboundMessage {
+export type SessionEndpointStatus = "idle" | "busy" | "retry"
+
+export interface PeerRegistryV2 {
+  version: 2
+  endpointId: string
+  processId: string
+  pid: number
+  sessionId: string
+  parentSessionId?: string
+  title: string
+  name: string
+  hostname: string
+  directory: string
+  status: SessionEndpointStatus
+  transport: LocalTransportAddress
+  serverUrl: string
+  inboxUrl: string
+  inboxToken: string
+  capabilities: string[]
+  timestamps: {
+    startedAt: number
+    updatedAt: number
+    heartbeatAt: number
+  }
+  policy: {
+    inboundPolicy: InboundPolicy
+    peerPermissions: PeerPermissionMode
+  }
+  pluginVersion: string
+  /** Compatibility aliases retained for existing formatters and commands. */
+  activeSessionId: string
+  activeSessionTitle: string
+  busy: boolean
+  queuedCount: number
+  inboundPolicy: InboundPolicy
+  startedAt: number
+  heartbeatAt: number
+}
+
+export type PeerRegistryEntry = PeerEntry | PeerRegistryV2
+
+/** Protocol-v1 input accepted from existing peers. */
+export interface InboundMessageV1 {
   id: string
   from: PeerFrom
   text: string
@@ -38,11 +80,66 @@ export interface InboundMessage {
   sentAt: number
 }
 
-export interface HeldMessage extends InboundMessage {
-  heldAt: number
+/** Backward-compatible name for protocol-v1 inbound input. */
+export type InboundMessage = InboundMessageV1
+
+/** Protocol-v2 message shape used by endpoint-addressed transports. */
+export interface PeerMessageV2 {
+  version: 2
+  messageId: string
+  fromEndpointId: string
+  toEndpointId: string
+  from: PeerFrom
+  text: string
+  via: string[]
+  sentAt: number
 }
 
-export type ReceiveStatus = "delivered" | "queued" | "held" | "refused" | "full"
+export type AcknowledgementStatus = "delivered" | "refused" | "expired" | "dropped" | "duplicate"
+
+/** Durable final outcome for a protocol-v2 message. */
+export interface PeerAcknowledgementV2 {
+  version: 2
+  messageId: string
+  fromEndpointId: string
+  toEndpointId: string
+  status: AcknowledgementStatus
+  acknowledgedAt: number
+}
+
+export interface OutboxRecord {
+  version: 1
+  messageId: string
+  fromEndpointId: string
+  toEndpointId: string
+  toName: string
+  text: string
+  createdAt: number
+  updatedAt: number
+  receiptStatus?: ReceiveStatus
+  finalStatus?: AcknowledgementStatus
+  acknowledgedAt?: number
+  error?: string
+}
+
+export type LocalTransportAddress =
+  | { type: "unix"; path: string }
+  | { type: "tcp"; host: "127.0.0.1"; port: number }
+
+export interface HeldMessage extends InboundMessage {
+  heldAt: number
+  expiresAt: number
+}
+
+export type ReceiveStatus =
+  | "delivered"
+  | "queued"
+  | "held"
+  | "refused"
+  | "expired"
+  | "dropped"
+  | "full"
+  | "duplicate"
 
 export interface PluginConfig {
   /** Override the storage dir (defaults to $XDG_DATA_HOME/opencode-plugin-peers). */
@@ -63,12 +160,16 @@ export interface PluginConfig {
   heartbeatMs?: number
   /** A peer is stale if its heartbeat is older than this. Default 30_000. */
   staleMs?: number
-  /** Max queued messages awaiting idle. Default 50. */
+  /** Max queued messages awaiting an immediate-delivery retry. Default 50. */
   maxQueue?: number
   /** Max held messages. Default 100. */
   maxHeld?: number
   /** Max bytes for a single message body. Default 8192. */
   maxMessageBytes?: number
+  /** Expiry for messages awaiting local approval. Default 300000 ms. */
+  heldExpiryMs?: number
+  /** Maximum sender timestamp age/skew accepted by the receiver. Default 300000 ms. */
+  maxMessageAgeMs?: number
   /** Outbound rate limit per peer per minute. Default 10. */
   sendRatePerMin?: number
   /** Inbound rate limit per sender per minute. Default 20. */

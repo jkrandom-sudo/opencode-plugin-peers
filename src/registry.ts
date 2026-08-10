@@ -7,7 +7,29 @@ import { randomBytes } from "node:crypto"
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { hostname } from "node:os"
 import { join } from "node:path"
-import type { InboundPolicy, Logger, PeerEntry } from "./types.js"
+import type {
+  InboundPolicy,
+  LocalTransportAddress,
+  Logger,
+  PeerEntry,
+  PeerPermissionMode,
+  PeerRegistryEntry,
+  PeerRegistryV2,
+  SessionEndpointStatus,
+} from "./types.js"
+
+export interface RegistryEndpoint {
+  endpointId: string
+  sessionId: string
+  parentSessionId?: string
+  title: string
+  name: string
+  directory: string
+  status: SessionEndpointStatus
+  startedAt: number
+  updatedAt: number
+  queuedCount: number
+}
 
 export interface RegistryDynamic {
   name: string
@@ -32,11 +54,17 @@ export interface RegistryOptions {
   heartbeatMs: number
   staleMs: number
   getDynamic: () => RegistryDynamic
+  /** Enables protocol-v2 publication while retaining one v1 compatibility file. */
+  getEndpoints?: () => RegistryEndpoint[]
+  /** Exact endpoint used by protocol-v1 routing and publication. */
+  getCompatibilityEndpointId?: () => string | null
+  transport?: LocalTransportAddress
+  peerPermissions?: PeerPermissionMode
   logger: Logger
 }
 
 export interface ListedPeer {
-  entry: PeerEntry
+  entry: PeerRegistryEntry
   alive: boolean
   staleReason: string | null
 }
@@ -65,18 +93,39 @@ export interface RegistryInstance {
   stop: () => Promise<void>
   heartbeat: () => Promise<void>
   list: () => Promise<ListedPeer[]>
-  isAlive: (entry: PeerEntry) => boolean
+  isAlive: (entry: PeerRegistryEntry) => boolean
   cleanupStale: () => Promise<number>
   selfFile: string
 }
 
 export function Registry(opts: RegistryOptions): RegistryInstance {
   const selfFile = join(opts.peersDir, `${opts.instanceId}.json`)
+  const selfV2Files = new Set<string>()
   let timer: ReturnType<typeof setInterval> | null = null
+  let writeTail: Promise<void> = Promise.resolve()
+  let stopPromise: Promise<void> | null = null
+  let lifecycle: "new" | "running" | "stopping" | "stopped" = "new"
   const startedAt = Date.now()
 
-  function buildEntry(): PeerEntry {
+  function compatibilityDynamic(): RegistryDynamic {
     const dyn = opts.getDynamic()
+    const endpoints = opts.getEndpoints?.() ?? []
+    const compatibilityId = opts.getCompatibilityEndpointId?.()
+    const latest = endpoints.find((endpoint) => endpoint.endpointId === compatibilityId)
+      ?? endpoints.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0]
+    if (!latest) return dyn
+    return {
+      name: latest.name,
+      inboundPolicy: dyn.inboundPolicy,
+      activeSessionId: latest.sessionId,
+      activeSessionTitle: latest.title,
+      busy: latest.status !== "idle",
+      queuedCount: latest.queuedCount,
+    }
+  }
+
+  function buildEntry(): PeerEntry {
+    const dyn = compatibilityDynamic()
     return {
       version: 1,
       instanceId: opts.instanceId,
@@ -98,25 +147,91 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
     }
   }
 
-  async function writeSelf(): Promise<void> {
-    const tmp = `${selfFile}.tmp`
-    await writeFile(tmp, JSON.stringify(buildEntry(), null, 2), { mode: 0o600 })
-    await chmod(tmp, 0o600).catch(() => {})
-    await rename(tmp, selfFile)
+  function buildV2Entry(endpoint: RegistryEndpoint, heartbeatAt: number): PeerRegistryV2 {
+    const inboundPolicy = opts.getDynamic().inboundPolicy
+    return {
+      version: 2,
+      endpointId: endpoint.endpointId,
+      processId: opts.instanceId,
+      pid: opts.pid,
+      sessionId: endpoint.sessionId,
+      ...(endpoint.parentSessionId ? { parentSessionId: endpoint.parentSessionId } : {}),
+      title: endpoint.title,
+      name: endpoint.name,
+      hostname: hostname(),
+      directory: endpoint.directory,
+      status: endpoint.status,
+      transport: opts.transport!,
+      serverUrl: opts.serverUrl,
+      inboxUrl: opts.inboxUrl,
+      inboxToken: opts.inboxToken,
+      capabilities: ["local", "protocol-v2", "prompt-async", "ack"],
+      timestamps: {
+        startedAt: endpoint.startedAt,
+        updatedAt: endpoint.updatedAt,
+        heartbeatAt,
+      },
+      policy: {
+        inboundPolicy,
+        peerPermissions: opts.peerPermissions ?? "allow",
+      },
+      pluginVersion: opts.pluginVersion,
+      activeSessionId: endpoint.sessionId,
+      activeSessionTitle: endpoint.title,
+      busy: endpoint.status !== "idle",
+      queuedCount: endpoint.queuedCount,
+      inboundPolicy,
+      startedAt: endpoint.startedAt,
+      heartbeatAt,
+    }
   }
 
-  async function readEntry(file: string): Promise<PeerEntry | null> {
+  async function writeEntry(path: string, entry: PeerRegistryEntry): Promise<void> {
+    const tmp = `${path}.${process.pid}.tmp`
+    await writeFile(tmp, JSON.stringify(entry, null, 2), { mode: 0o600 })
+    await chmod(tmp, 0o600).catch(() => {})
+    await rename(tmp, path)
+  }
+
+  async function writeSelf(): Promise<void> {
+    await writeEntry(selfFile, buildEntry())
+    if (!opts.getEndpoints || !opts.transport) return
+    const heartbeatAt = Date.now()
+    const nextFiles = new Set<string>()
+    for (const endpoint of opts.getEndpoints()) {
+      const safeId = endpoint.endpointId.replace(/[^a-zA-Z0-9_-]/g, "_")
+      const path = join(opts.peersDir, `${opts.instanceId}.${safeId}.v2.json`)
+      await writeEntry(path, buildV2Entry(endpoint, heartbeatAt))
+      nextFiles.add(path)
+    }
+    for (const path of selfV2Files) {
+      if (!nextFiles.has(path)) await rm(path, { force: true })
+    }
+    selfV2Files.clear()
+    for (const path of nextFiles) selfV2Files.add(path)
+  }
+
+  function scheduleWrite(): Promise<void> {
+    if (lifecycle !== "running") return Promise.resolve()
+    const writeIfRunning = () => lifecycle === "running" ? writeSelf() : Promise.resolve()
+    const pending = writeTail.then(writeIfRunning, writeIfRunning)
+    writeTail = pending.catch(() => {})
+    return pending
+  }
+
+  async function readEntry(file: string): Promise<PeerRegistryEntry | null> {
     try {
       const raw = await readFile(join(opts.peersDir, file), "utf8")
-      const entry = JSON.parse(raw) as PeerEntry
-      if (entry.version !== 1 || !entry.instanceId || !entry.inboxUrl) return null
-      return entry
+      const entry = JSON.parse(raw) as PeerRegistryEntry
+      if (entry.version === 1 && entry.instanceId && entry.inboxUrl) return entry
+      if (entry.version === 2 && entry.endpointId && entry.processId && entry.transport && entry.sessionId) return entry
+      return null
     } catch {
       return null
     }
   }
 
-  function staleReason(entry: PeerEntry, now: number): string | null {
+  function staleReason(entry: PeerRegistryEntry, now: number): string | null {
     const ageMs = now - entry.heartbeatAt
     if (ageMs > opts.staleMs) return `last heartbeat ${Math.round(ageMs / 1000)}s ago`
     if (!pidAlive(entry.pid)) return `pid ${entry.pid} is not running`
@@ -127,9 +242,16 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
     selfFile,
 
     async start() {
+      if (lifecycle !== "new") throw new Error(`registry cannot start while ${lifecycle}`)
       await mkdir(opts.peersDir, { recursive: true, mode: 0o700 })
       await chmod(opts.peersDir, 0o700).catch(() => {})
-      await writeSelf()
+      lifecycle = "running"
+      try {
+        await scheduleWrite()
+      } catch (err) {
+        lifecycle = "stopped"
+        throw err
+      }
       timer = setInterval(() => {
         inst.heartbeat().catch((err) => {
           opts.logger("warn", "heartbeat failed", { error: String(err) })
@@ -139,13 +261,25 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
     },
 
     async stop() {
+      if (stopPromise) return stopPromise
+      if (lifecycle === "stopped") return
+      lifecycle = "stopping"
       if (timer) clearInterval(timer)
       timer = null
-      await rm(selfFile, { force: true })
+      stopPromise = (async () => {
+        await writeTail
+        await rm(selfFile, { force: true })
+        await Promise.all([...selfV2Files].map((path) => rm(path, { force: true })))
+        selfV2Files.clear()
+        lifecycle = "stopped"
+      })()
+      return stopPromise
     },
 
     async heartbeat() {
-      await writeSelf()
+      if (lifecycle !== "running") return
+      await scheduleWrite()
+      if (lifecycle !== "running") return
       await inst.cleanupStale()
     },
 
@@ -157,16 +291,33 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
         return []
       }
       const now = Date.now()
-      const out: ListedPeer[] = []
+      const entries: PeerRegistryEntry[] = []
       for (const file of files) {
         if (!file.endsWith(".json")) continue
         const entry = await readEntry(file)
         if (!entry) continue
-        if (entry.instanceId === opts.instanceId) continue
-        const reason = staleReason(entry, now)
-        out.push({ entry, alive: reason === null, staleReason: reason })
+        if (entry.version === 1 && entry.instanceId === opts.instanceId) continue
+        entries.push(entry)
       }
-      return out
+      const v2Processes = new Set(entries.flatMap((entry) => entry.version === 2 ? [entry.processId] : []))
+      const out: ListedPeer[] = []
+      const v2ByEndpoint = new Map<string, ListedPeer>()
+      for (const entry of entries) {
+        if (entry.version === 1 && v2Processes.has(entry.instanceId)) continue
+        const reason = staleReason(entry, now)
+        const listed = { entry, alive: reason === null, staleReason: reason }
+        if (entry.version !== 2) {
+          out.push(listed)
+          continue
+        }
+        const current = v2ByEndpoint.get(entry.endpointId)
+        const currentHeartbeat = current?.entry.heartbeatAt ?? -Infinity
+        if (!current || (listed.alive && !current.alive) ||
+          (listed.alive === current.alive && entry.heartbeatAt > currentHeartbeat)) {
+          v2ByEndpoint.set(entry.endpointId, listed)
+        }
+      }
+      return [...out, ...v2ByEndpoint.values()]
     },
 
     isAlive(entry) {
@@ -174,6 +325,7 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
     },
 
     async cleanupStale() {
+      if (lifecycle !== "running") return 0
       let files: string[] = []
       try {
         files = await readdir(opts.peersDir)
@@ -185,7 +337,7 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
       for (const file of files) {
         if (!file.endsWith(".json")) continue
         const path = join(opts.peersDir, file)
-        if (path === selfFile) continue
+        if (path === selfFile || selfV2Files.has(path)) continue
         try {
           const st = await stat(path)
           if (now - st.mtimeMs < 5 * 60_000) continue

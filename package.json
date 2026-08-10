@@ -1,6 +1,6 @@
 {
   "name": "opencode-plugin-peers",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "Cross-session messaging for opencode \u2014 let independent sessions discover and text each other, modeled after Claude Code's cross-session messaging",
   "type": "module",
   "main": "./dist/index.js",
@@ -23,6 +23,7 @@
     "./commands/list-agents.md": "./commands/list-agents.md",
     "./commands/peers-name.md": "./commands/peers-name.md",
     "./commands/peers-inbox.md": "./commands/peers-inbox.md",
+    "./commands/peers-outbox.md": "./commands/peers-outbox.md",
     "./commands/*": "./commands/*"
   },
   "files": [
@@ -84,7 +85,8 @@
       "commands/peers.md",
       "commands/list-agents.md",
       "commands/peers-name.md",
-      "commands/peers-inbox.md"
+      "commands/peers-inbox.md",
+      "commands/peers-outbox.md"
     ]
   }
 }

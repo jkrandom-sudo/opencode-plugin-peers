@@ -1,15 +1,95 @@
 /**
- * In-memory delivery queue (FIFO, flushed when the session is idle) and a
- * persisted held inbox for messages awaiting human approval.
+ * Endpoint-scoped durable delivery queue and held inbox.
  */
 
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises"
-import { dirname } from "node:path"
-import type { HeldMessage, InboundMessage, Logger } from "./types.js"
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs"
+import { createHash, randomBytes } from "node:crypto"
+import { dirname, join, resolve } from "node:path"
+import type { ResolvedConfig } from "./config.js"
+import type { HeldMessage, InboundMessage, Logger, PeerAcknowledgementV2, ReceiveStatus } from "./types.js"
+
+const COMPLETED_DEDUPE_RETENTION_MS = 86_400_000
+const LOCK_STALE_MS = 30_000
+const LOCK_WAIT_MS = 5_000
+const LOCK_POLL_MS = 10
+
+type SpoolState = "queued" | "held" | "inflight" | "done"
+
+interface SpoolRecord {
+  version: 2
+  state: SpoolState
+  message: InboundMessage | HeldMessage
+  acceptedAt?: number
+  sequence?: number
+  heldAt?: number
+  expiresAt?: number
+  ack?: PeerAcknowledgementV2
+  ackSentAt?: number
+  duplicateOfMessageId?: string
+}
+
+export function stableSpoolEndpointId(directory: string): string {
+  const digest = createHash("sha256").update(`workspace-v1\0${resolve(directory)}`).digest("hex")
+  return `workspace-${digest.slice(0, 24)}`
+}
+
+export function stableSessionEndpointId(sessionId: string): string {
+  const digest = createHash("sha256").update(`session-v1\0${sessionId}`).digest("hex")
+  return `session-${digest.slice(0, 24)}`
+}
+
+export function createSessionMessageQueue(opts: {
+  config: ResolvedConfig
+  sessionId: string
+  logger: Logger
+}): QueueInstance {
+  return MessageQueue({
+    endpointId: stableSessionEndpointId(opts.sessionId),
+    maxQueue: opts.config.maxQueue,
+    maxHeld: opts.config.maxHeld,
+    heldExpiryMs: opts.config.heldExpiryMs,
+    inboxFile: opts.config.inboxFile,
+    logger: opts.logger,
+  })
+}
+
+export function createProcessMessageQueue(opts: {
+  config: ResolvedConfig
+  directory: string
+  logger: Logger
+}): QueueInstance {
+  return MessageQueue({
+    endpointId: stableSpoolEndpointId(opts.directory),
+    maxQueue: opts.config.maxQueue,
+    maxHeld: opts.config.maxHeld,
+    heldExpiryMs: opts.config.heldExpiryMs,
+    inboxFile: opts.config.inboxFile,
+    logger: opts.logger,
+  })
+}
 
 export interface QueueOptions {
+  /** Logical receiver identity; Task 2 supplies one value per session endpoint. */
+  endpointId?: string
   maxQueue: number
   maxHeld: number
+  /** Held messages expire after five minutes unless explicitly configured otherwise. */
+  heldExpiryMs?: number
+  /** Short same-sender/content debounce window. */
+  debounceMs?: number
   inboxFile: string
   logger: Logger
 }
@@ -18,37 +98,582 @@ export interface QueueInstance {
   /** Returns false when the queue is full. */
   enqueue: (msg: InboundMessage) => boolean
   drain: () => InboundMessage[]
+  /** Mark a flushed batch as delivered and return durable final acknowledgements. */
+  complete: (messages: InboundMessage[]) => Promise<PeerAcknowledgementV2[]>
+  /** Return a failed delivery batch from inflight to the front of the queue. */
+  requeue: (messages: InboundMessage[]) => Promise<void>
+  /** Returns a durable duplicate acknowledgement when this sender/message pair already exists. */
+  duplicateAcknowledgement: (msg: InboundMessage) => PeerAcknowledgementV2 | null
+  /** The original receiver state returned for an idempotent retry. */
+  existingStatus: (msg: InboundMessage) => ReceiveStatus | null
+  isDebounced: (msg: InboundMessage) => boolean
+  /** Refuse an inbound message and retain its final acknowledgement for deduplication. */
+  refuse: (msg: InboundMessage) => Promise<PeerAcknowledgementV2>
   pending: () => InboundMessage[]
   size: () => number
 
   hold: (msg: InboundMessage) => Promise<boolean>
   held: () => HeldMessage[]
+  /** Move expired held records to done and return their final acknowledgements. */
+  expireHeld: () => Promise<PeerAcknowledgementV2[]>
+  /** Final outcomes that still need to be returned to their sender. */
+  pendingAcknowledgements: () => PeerAcknowledgementV2[]
+  /** Durably record successful ACK transport so restarts do not resend forever. */
+  markAcknowledgementSent: (ack: PeerAcknowledgementV2) => Promise<void>
   /** Accept by 1-based index or "all"; returns the messages moved to the queue. */
   acceptHeld: (which: number | "all") => Promise<HeldMessage[]>
   dropHeld: (which: number | "all") => Promise<number>
   loadHeld: () => Promise<void>
 }
 
+interface LockableQueue extends QueueInstance {
+  withExclusiveLock: <T>(operation: () => T) => T
+}
+
+export interface SpoolMigrationResult {
+  migrated: number
+  deduplicated: number
+  quarantined: number
+  sourceEndpointId: string
+  targetEndpointId: string
+}
+
+function migrationStateFiles(spoolDir: string, state: SpoolState): string[] {
+  try {
+    return readdirSync(join(spoolDir, state)).filter((file) => file.endsWith(".json")).sort()
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return []
+    throw err
+  }
+}
+
+function syncMigrationDirectory(directory: string): void {
+  const fd = openSync(directory, "r")
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function ensureMigrationDirectory(directory: string): void {
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  chmodSync(directory, 0o700)
+}
+
+function persistMigrationRecord(target: string, record: unknown): void {
+  const directory = dirname(target)
+  ensureMigrationDirectory(directory)
+  const temporary = join(directory, `.${process.pid}.${randomBytes(8).toString("hex")}.tmp`)
+  const fd = openSync(temporary, "wx", 0o600)
+  try {
+    writeSync(fd, JSON.stringify(record))
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+  chmodSync(temporary, 0o600)
+  renameSync(temporary, target)
+  syncMigrationDirectory(directory)
+}
+
+function readSequence(path: string): number | null {
+  try {
+    const record = JSON.parse(readFileSync(path, "utf8")) as { value?: unknown }
+    return typeof record.value === "number" && Number.isSafeInteger(record.value) ? record.value : null
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null
+    throw err
+  }
+}
+
+function sameFileContents(first: string, second: string): boolean {
+  try {
+    return readFileSync(first, "utf8") === readFileSync(second, "utf8")
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Move Task 1's directory-scoped spool into Task 2's compatibility session.
+ * Individual renames are atomic and the operation is restart-safe. Both
+ * endpoint locks are acquired in endpoint-ID order so concurrent recovery
+ * cannot deadlock or race normal queue state transitions.
+ */
+export async function migrateWorkspaceSpool(opts: {
+  config: ResolvedConfig
+  directory: string
+  targetSessionId: string
+  logger: Logger
+}): Promise<SpoolMigrationResult> {
+  const sourceEndpointId = stableSpoolEndpointId(opts.directory)
+  const targetEndpointId = stableSessionEndpointId(opts.targetSessionId)
+  const result: SpoolMigrationResult = {
+    migrated: 0,
+    deduplicated: 0,
+    quarantined: 0,
+    sourceEndpointId,
+    targetEndpointId,
+  }
+  if (sourceEndpointId === targetEndpointId) return result
+
+  const sourceDir = join(dirname(opts.config.inboxFile), "spool", sourceEndpointId)
+  const targetDir = join(dirname(opts.config.inboxFile), "spool", targetEndpointId)
+  if (!existsSync(sourceDir)) return result
+  const sourceHasState = (['queued', 'held', 'inflight', 'done'] as SpoolState[])
+    .some((state) => migrationStateFiles(sourceDir, state).length > 0)
+  if (!sourceHasState && !existsSync(join(sourceDir, "sequence"))) return result
+
+  const queueOptions = {
+    maxQueue: opts.config.maxQueue,
+    maxHeld: opts.config.maxHeld,
+    heldExpiryMs: opts.config.heldExpiryMs,
+    inboxFile: opts.config.inboxFile,
+    logger: opts.logger,
+  }
+  const queues = new Map<string, LockableQueue>([
+    [sourceEndpointId, MessageQueue({ ...queueOptions, endpointId: sourceEndpointId }) as LockableQueue],
+    [targetEndpointId, MessageQueue({ ...queueOptions, endpointId: targetEndpointId }) as LockableQueue],
+  ])
+  const [firstId, secondId] = [sourceEndpointId, targetEndpointId].sort()
+  const collisions: Array<{ state: SpoolState; file: string; quarantine: string }> = []
+
+  queues.get(firstId)!.withExclusiveLock(() => {
+    queues.get(secondId)!.withExclusiveLock(() => {
+      for (const state of ["queued", "held", "inflight", "done"] as const) {
+        for (const file of migrationStateFiles(sourceDir, state)) {
+          const source = join(sourceDir, state, file)
+          const targetLocations = (["queued", "held", "inflight", "done"] as const)
+            .map((targetState) => join(targetDir, targetState, file))
+            .filter((path) => existsSync(path))
+          if (targetLocations.length === 0) {
+            const target = join(targetDir, state, file)
+            renameSync(source, target)
+            syncMigrationDirectory(join(sourceDir, state))
+            syncMigrationDirectory(join(targetDir, state))
+            result.migrated++
+            continue
+          }
+          if (targetLocations.length === 1 && targetLocations[0] === join(targetDir, state, file) && sameFileContents(source, targetLocations[0])) {
+            unlinkSync(source)
+            syncMigrationDirectory(join(sourceDir, state))
+            result.deduplicated++
+            continue
+          }
+
+          const base = join(targetDir, "migration-quarantine", sourceEndpointId, state)
+          ensureMigrationDirectory(base)
+          let quarantine = join(base, file)
+          if (existsSync(quarantine) && !sameFileContents(source, quarantine)) {
+            const digest = createHash("sha256").update(readFileSync(source)).digest("hex").slice(0, 16)
+            quarantine = join(base, `${file.slice(0, -5)}.${digest}.json`)
+          }
+          if (existsSync(quarantine) && sameFileContents(source, quarantine)) {
+            unlinkSync(source)
+          } else {
+            renameSync(source, quarantine)
+            syncMigrationDirectory(base)
+          }
+          syncMigrationDirectory(join(sourceDir, state))
+          result.quarantined++
+          collisions.push({ state, file, quarantine })
+        }
+      }
+
+      const sourceSequencePath = join(sourceDir, "sequence")
+      const targetSequencePath = join(targetDir, "sequence")
+      const sourceSequence = readSequence(sourceSequencePath)
+      const targetSequence = readSequence(targetSequencePath)
+      if (sourceSequence !== null) {
+        const mergedSequence = Math.max(sourceSequence, targetSequence ?? 0)
+        if (targetSequence !== mergedSequence) persistMigrationRecord(targetSequencePath, { value: mergedSequence })
+        unlinkSync(sourceSequencePath)
+        syncMigrationDirectory(sourceDir)
+      }
+
+      persistMigrationRecord(join(targetDir, ".migrations", `${sourceEndpointId}.json`), {
+        version: 1,
+        sourceEndpointId,
+        targetEndpointId,
+        completedAt: Date.now(),
+      })
+    })
+  })
+
+  for (const collision of collisions) {
+    await opts.logger("warn", "workspace spool record quarantined during session migration", {
+      sourceEndpointId,
+      targetEndpointId,
+      state: collision.state,
+      file: collision.file,
+      quarantine: collision.quarantine,
+    })
+  }
+  await opts.logger("info", "workspace spool migration completed", { ...result })
+  return result
+}
+
 export function MessageQueue(opts: QueueOptions): QueueInstance {
   let queue: InboundMessage[] = []
   let held: HeldMessage[] = []
 
-  async function persistHeld(): Promise<void> {
+  const spoolDir = join(dirname(opts.inboxFile), "spool", opts.endpointId ?? "legacy")
+  const heldExpiryMs = opts.heldExpiryMs ?? 300_000
+  const debounceMs = opts.debounceMs ?? 1_000
+  const recentContent = new Map<string, number>()
+  const lockTicketsDir = join(spoolDir, ".lock-tickets")
+  const sequenceFile = join(spoolDir, "sequence")
+
+  function ensureEndpointDirectories(): void {
+    mkdirSync(spoolDir, { recursive: true, mode: 0o700 })
+    chmodSync(spoolDir, 0o700)
+    for (const state of ["queued", "held", "inflight", "done"]) {
+      const directory = join(spoolDir, state)
+      mkdirSync(directory, { recursive: true, mode: 0o700 })
+      chmodSync(directory, 0o700)
+    }
+    mkdirSync(lockTicketsDir, { recursive: true, mode: 0o700 })
+    chmodSync(lockTicketsDir, 0o700)
+  }
+
+  function removeClaim(path: string): void {
     try {
-      await mkdir(dirname(opts.inboxFile), { recursive: true, mode: 0o700 })
-      const tmp = `${opts.inboxFile}.tmp`
-      await writeFile(tmp, JSON.stringify(held, null, 2), { mode: 0o600 })
-      await chmod(tmp, 0o600).catch(() => {})
-      await rename(tmp, opts.inboxFile)
+      unlinkSync(path)
+      syncDirectory(lockTicketsDir)
     } catch (err) {
-      await opts.logger("error", "failed to persist held inbox", { error: String(err) })
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err
     }
   }
 
-  function pick(which: number | "all"): HeldMessage[] {
+  function createClaim(path: string, record: unknown): void {
+    const fd = openSync(path, "wx", 0o600)
+    try {
+      writeSync(fd, JSON.stringify(record))
+      fsyncSync(fd)
+    } catch (err) {
+      try {
+        closeSync(fd)
+      } finally {
+        removeClaim(path)
+      }
+      throw err
+    }
+    try {
+      closeSync(fd)
+      syncDirectory(lockTicketsDir)
+    } catch (err) {
+      removeClaim(path)
+      throw err
+    }
+  }
+
+  function claimFiles(): string[] {
+    return readdirSync(lockTicketsDir).filter(
+      (file) => /^choosing-[a-f0-9]{32}\.json$/.test(file) || /^ticket-\d{16}-[a-f0-9]{32}\.json$/.test(file)
+    )
+  }
+
+  function recoverStaleClaims(): void {
+    for (const file of claimFiles()) {
+      const path = join(lockTicketsDir, file)
+      try {
+        if (Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS) removeClaim(path)
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err
+      }
+    }
+  }
+
+  function ticketNumber(file: string): number | null {
+    const match = /^ticket-(\d{16})-[a-f0-9]{32}\.json$/.exec(file)
+    return match ? Number(match[1]) : null
+  }
+
+  // Filesystem bakery lock: every doorway/queue entry has a unique path that
+  // is never reused, so stale cleanup and release can only unlink the exact
+  // claim they observed or created. Choosing entries prevent a late contender
+  // from publishing a lower ticket after another contender has entered.
+  function acquireLockTicket(deadline: number): string {
+    const token = randomBytes(16).toString("hex")
+    const choosingPath = join(lockTicketsDir, `choosing-${token}.json`)
+    let ticketPath: string | null = null
+    createClaim(choosingPath, { kind: "choosing", token, pid: process.pid, createdAt: Date.now() })
+    try {
+      recoverStaleClaims()
+      const highest = claimFiles().reduce((max, file) => Math.max(max, ticketNumber(file) ?? 0), 0)
+      if (Date.now() >= deadline) throw new Error(`timed out acquiring message spool lock: ${lockTicketsDir}`)
+      const ticket = highest + 1
+      ticketPath = join(lockTicketsDir, `ticket-${String(ticket).padStart(16, "0")}-${token}.json`)
+      createClaim(ticketPath, { kind: "ticket", ticket, token, pid: process.pid, createdAt: Date.now() })
+    } finally {
+      removeClaim(choosingPath)
+    }
+
+    for (;;) {
+      recoverStaleClaims()
+      if (!existsSync(ticketPath)) {
+        throw new Error(`message spool lock claim expired before admission: ${ticketPath}`)
+      }
+      if (Date.now() >= deadline) {
+        removeClaim(ticketPath)
+        throw new Error(`timed out acquiring message spool lock: ${lockTicketsDir}`)
+      }
+      const claims = claimFiles()
+      const choosing = claims.some((file) => file.startsWith("choosing-"))
+      const tickets = claims
+        .flatMap((file) => {
+          const ticket = ticketNumber(file)
+          return ticket === null ? [] : [{ file, ticket }]
+        })
+        .sort((a, b) => a.ticket - b.ticket || (a.file < b.file ? -1 : a.file > b.file ? 1 : 0))
+      if (!choosing && tickets[0]?.file === ticketPath.slice(lockTicketsDir.length + 1)) return ticketPath
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_POLL_MS)
+    }
+  }
+
+  function withEndpointLock<T>(operation: () => T): T {
+    ensureEndpointDirectories()
+    const ticketPath = acquireLockTicket(Date.now() + LOCK_WAIT_MS)
+    try {
+      return operation()
+    } finally {
+      removeClaim(ticketPath)
+    }
+  }
+
+  function stateFileCount(state: SpoolState): number {
+    return stateRecords(state).length
+  }
+
+  function stateRecords(state: SpoolState): SpoolRecord[] {
+    const directory = join(spoolDir, state)
+    let files: string[] = []
+    try {
+      files = readdirSync(directory).filter((file) => file.endsWith(".json"))
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        void opts.logger("warn", "failed to read message spool directory", { state, error: String(err) })
+      }
+      return []
+    }
+    const records: SpoolRecord[] = []
+    for (const file of files) {
+      try {
+        const record = JSON.parse(readFileSync(join(directory, file), "utf8")) as SpoolRecord
+        if (
+          record?.version !== 2 ||
+          record.state !== state ||
+          !record.message?.id ||
+          !record.message.from?.instanceId ||
+          !Number.isFinite(record.message.sentAt) ||
+          (state === "held" && !Number.isFinite((record.message as HeldMessage).expiresAt)) ||
+          (state === "done" && !record.ack)
+        ) {
+          throw new Error("invalid spool record")
+        }
+        records.push(record)
+      } catch (err) {
+        void opts.logger("warn", "skipping malformed message spool record", { state, file, error: String(err) })
+      }
+    }
+    return records.sort((a, b) => {
+      const aOrder = a.sequence ?? a.acceptedAt ?? a.message.sentAt
+      const bOrder = b.sequence ?? b.acceptedAt ?? b.message.sentAt
+      return aOrder - bOrder
+    })
+  }
+
+  function nextSequence(): number {
+    let current = 0
+    try {
+      const stored = JSON.parse(readFileSync(sequenceFile, "utf8")) as { value?: number }
+      if (typeof stored.value === "number" && Number.isSafeInteger(stored.value)) current = stored.value
+    } catch {
+      // The first accepted record starts the sequence.
+    }
+    const value = current + 1
+    persistRecord(sequenceFile, { value })
+    return value
+  }
+
+  function readRecord(state: SpoolState, message: InboundMessage): SpoolRecord | null {
+    try {
+      const record = JSON.parse(readFileSync(join(spoolDir, state, `${recordName(message)}.json`), "utf8")) as SpoolRecord
+      if (
+        record?.version !== 2 ||
+        record.state !== state ||
+        record.message?.id !== message.id ||
+        record.message.from?.instanceId !== message.from.instanceId ||
+        (state === "done" && !record.ack)
+      ) return null
+      return record
+    } catch {
+      return null
+    }
+  }
+
+  function refreshHeld(): void {
+    held = stateRecords("held").map((record) => record.message as HeldMessage)
+  }
+
+  function refreshQueue(): void {
+    queue = stateRecords("queued").map((record) => record.message as InboundMessage)
+  }
+
+  function recordName(msg: InboundMessage): string {
+    return createHash("sha256").update(`${msg.from.instanceId}\0${msg.id}`).digest("hex")
+  }
+
+  function queuedFile(msg: InboundMessage): string {
+    return join(spoolDir, "queued", `${recordName(msg)}.json`)
+  }
+
+  function inflightFile(msg: InboundMessage): string {
+    return join(spoolDir, "inflight", `${recordName(msg)}.json`)
+  }
+
+  function heldFile(msg: InboundMessage): string {
+    return join(spoolDir, "held", `${recordName(msg)}.json`)
+  }
+
+  function doneFile(msg: InboundMessage): string {
+    return join(spoolDir, "done", `${recordName(msg)}.json`)
+  }
+
+  function existingState(msg: InboundMessage): "queued" | "held" | "inflight" | "done" | null {
+    for (const state of ["queued", "held", "inflight", "done"] as const) {
+      if (readRecord(state, msg)) return state
+    }
+    return null
+  }
+
+  function contentKey(msg: InboundMessage): string {
+    return createHash("sha256").update(`${msg.from.instanceId}\0${msg.text}`).digest("hex")
+  }
+
+  function locallyDebounced(msg: InboundMessage): boolean {
+    const seenAt = recentContent.get(contentKey(msg))
+    return typeof seenAt === "number" && seenAt > Date.now() - debounceMs
+  }
+
+  function noteContent(msg: InboundMessage): void {
+    recentContent.set(contentKey(msg), Date.now())
+  }
+
+  function recentContentRecord(msg: InboundMessage): SpoolRecord | null {
+    const cutoff = Date.now() - debounceMs
+    for (const state of ["queued", "held", "inflight", "done"] as const) {
+      for (const record of stateRecords(state)) {
+        const acceptedAt = record.acceptedAt ?? record.heldAt ?? record.message.sentAt
+        if (
+          acceptedAt > cutoff &&
+          record.message.id !== msg.id &&
+          record.message.from.instanceId === msg.from.instanceId &&
+          record.message.text === msg.text
+        ) {
+          return record
+        }
+      }
+    }
+    return null
+  }
+
+  function ensureSpoolDirectory(directory: string): void {
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    chmodSync(spoolDir, 0o700)
+    chmodSync(directory, 0o700)
+  }
+
+  function syncDirectory(directory: string): void {
+    const dirFd = openSync(directory, "r")
+    try {
+      fsyncSync(dirFd)
+    } finally {
+      closeSync(dirFd)
+    }
+  }
+
+  function persistRecord(target: string, record: unknown): void {
+    const directory = dirname(target)
+    ensureSpoolDirectory(directory)
+    const temporary = join(directory, `.${process.pid}.${Date.now()}.tmp`)
+    const fd = openSync(temporary, "w", 0o600)
+    try {
+      writeSync(fd, JSON.stringify(record))
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    chmodSync(temporary, 0o600)
+    renameSync(temporary, target)
+    syncDirectory(directory)
+  }
+
+  function persistQueued(msg: InboundMessage): void {
+    persistRecord(queuedFile(msg), {
+      version: 2,
+      state: "queued",
+      message: msg,
+      acceptedAt: Date.now(),
+      sequence: nextSequence(),
+    })
+  }
+
+  function acknowledgement(message: InboundMessage, status: PeerAcknowledgementV2["status"]): PeerAcknowledgementV2 {
+    return {
+      version: 2,
+      messageId: message.id,
+      fromEndpointId: message.from.instanceId,
+      toEndpointId: opts.endpointId ?? "legacy",
+      status,
+      acknowledgedAt: Date.now(),
+    }
+  }
+
+  function finish(
+    message: InboundMessage,
+    sourceState: "held" | "inflight",
+    status: PeerAcknowledgementV2["status"]
+  ): PeerAcknowledgementV2 {
+    const sourceRecord = readRecord(sourceState, message)
+    if (!sourceRecord) {
+      const prior = readRecord("done", message)?.ack
+      if (prior) return prior
+      throw new Error(`missing ${sourceState} spool record for message ${message.id}`)
+    }
+    const ack = acknowledgement(message, status)
+    persistRecord(doneFile(message), {
+      ...sourceRecord,
+      state: "done",
+      message,
+      ack,
+    })
+    const source = join(spoolDir, sourceState, `${recordName(message)}.json`)
+    unlinkSync(source)
+    syncDirectory(dirname(source))
+    return ack
+  }
+
+  function persistDuplicateLocked(message: InboundMessage, duplicateOf: SpoolRecord): PeerAcknowledgementV2 {
+    const ack = acknowledgement(message, "duplicate")
+    persistRecord(doneFile(message), {
+      version: 2,
+      state: "done",
+      message,
+      ack,
+      acceptedAt: Date.now(),
+      sequence: nextSequence(),
+      duplicateOfMessageId: duplicateOf.message.id,
+    })
+    return ack
+  }
+
+  function pick(which: number | "all", limit = Infinity): HeldMessage[] {
+    if (limit <= 0) return []
     if (which === "all") {
-      const out = held
-      held = []
+      const out = held.slice(0, limit)
+      held = held.slice(out.length)
       return out
     }
     const idx = which - 1
@@ -56,17 +681,117 @@ export function MessageQueue(opts: QueueOptions): QueueInstance {
     return held.splice(idx, 1)
   }
 
-  return {
+  function expireHeldRecordsLocked(): PeerAcknowledgementV2[] {
+    refreshHeld()
+    const now = Date.now()
+    const expired = held.filter((message) => message.expiresAt <= now)
+    held = held.filter((message) => message.expiresAt > now)
+    return expired.map((message) => finish(message, "held", "expired"))
+  }
+
+  async function expireHeldRecords(): Promise<PeerAcknowledgementV2[]> {
+    return withEndpointLock(expireHeldRecordsLocked)
+  }
+
+  const instance: LockableQueue = {
     enqueue(msg) {
-      if (queue.length >= opts.maxQueue) return false
-      queue.push(msg)
-      return true
+      return withEndpointLock(() => {
+        if (existingState(msg)) return false
+        const duplicate = recentContentRecord(msg)
+        if (duplicate || locallyDebounced(msg)) {
+          persistDuplicateLocked(msg, duplicate ?? {
+            version: 2,
+            state: "queued",
+            message: msg,
+          })
+          return false
+        }
+        if (stateFileCount("queued") + stateFileCount("inflight") >= opts.maxQueue) return false
+        persistQueued(msg)
+        noteContent(msg)
+        queue.push(msg)
+        return true
+      })
     },
 
     drain() {
-      const out = queue
-      queue = []
-      return out
+      return withEndpointLock(() => {
+        const records = stateRecords("queued")
+        const out = records.map((record) => record.message as InboundMessage)
+        for (const record of records) {
+          const message = record.message as InboundMessage
+          persistRecord(inflightFile(message), { ...record, state: "inflight", message })
+          unlinkSync(queuedFile(message))
+          syncDirectory(dirname(queuedFile(message)))
+        }
+        queue = []
+        return out
+      })
+    },
+
+    async complete(messages) {
+      return withEndpointLock(() => messages.map((message) => finish(message, "inflight", "delivered")))
+    },
+
+    async requeue(messages) {
+      withEndpointLock(() => {
+        for (const message of messages) {
+          const record = readRecord("inflight", message)
+          if (!record) continue
+          persistRecord(queuedFile(message), { ...record, state: "queued", message })
+          unlinkSync(inflightFile(message))
+          syncDirectory(dirname(inflightFile(message)))
+        }
+        refreshQueue()
+      })
+    },
+
+    duplicateAcknowledgement(msg) {
+      const record = readRecord("done", msg)
+      return record?.ack?.status === "duplicate" ? record.ack : null
+    },
+
+    existingStatus(msg) {
+      switch (existingState(msg)) {
+        case "queued":
+        case "inflight":
+          return "queued"
+        case "held":
+          return "held"
+        case "done": {
+          return readRecord("done", msg)?.ack?.status ?? null
+        }
+        default:
+          return null
+      }
+    },
+
+    isDebounced(msg) {
+      return withEndpointLock(() => {
+        if (existingState(msg)) return false
+        const duplicate = recentContentRecord(msg)
+        if (!duplicate && !locallyDebounced(msg)) return false
+        persistDuplicateLocked(msg, duplicate ?? { version: 2, state: "queued", message: msg })
+        return true
+      })
+    },
+
+    async refuse(msg) {
+      return withEndpointLock(() => {
+        const priorState = existingState(msg)
+        if (priorState === "done") return readRecord("done", msg)!.ack!
+        if (priorState) return acknowledgement(msg, "duplicate")
+        const ack = acknowledgement(msg, "refused")
+        persistRecord(doneFile(msg), {
+          version: 2,
+          state: "done",
+          message: msg,
+          ack,
+          acceptedAt: Date.now(),
+          sequence: nextSequence(),
+        })
+        return ack
+      })
     },
 
     pending() {
@@ -78,41 +803,129 @@ export function MessageQueue(opts: QueueOptions): QueueInstance {
     },
 
     async hold(msg) {
-      if (held.length >= opts.maxHeld) return false
-      held.push({ ...msg, heldAt: Date.now() })
-      await persistHeld()
-      return true
+      return withEndpointLock(() => {
+        if (existingState(msg)) return false
+        const duplicate = recentContentRecord(msg)
+        if (duplicate || locallyDebounced(msg)) {
+          persistDuplicateLocked(msg, duplicate ?? { version: 2, state: "held", message: msg })
+          return false
+        }
+        if (stateFileCount("held") >= opts.maxHeld) return false
+        const heldAt = Date.now()
+        const heldMessage = { ...msg, heldAt, expiresAt: heldAt + heldExpiryMs }
+        persistRecord(heldFile(msg), {
+          version: 2,
+          state: "held",
+          message: heldMessage,
+          heldAt,
+          expiresAt: heldMessage.expiresAt,
+          acceptedAt: heldAt,
+          sequence: nextSequence(),
+        })
+        noteContent(msg)
+        held.push(heldMessage)
+        return true
+      })
     },
 
     held() {
       return [...held]
     },
 
+    expireHeld: expireHeldRecords,
+
+    pendingAcknowledgements() {
+      return withEndpointLock(() => stateRecords("done")
+        .filter((record) => record.ack && !record.ackSentAt)
+        .map((record) => record.ack!))
+    },
+
+    async markAcknowledgementSent(ack) {
+      withEndpointLock(() => {
+        const record = stateRecords("done").find((candidate) =>
+          candidate.ack?.messageId === ack.messageId &&
+          candidate.ack.fromEndpointId === ack.fromEndpointId &&
+          candidate.ack.toEndpointId === ack.toEndpointId
+        )
+        if (!record) return
+        persistRecord(doneFile(record.message), { ...record, ackSentAt: Date.now() })
+      })
+    },
+
     async acceptHeld(which) {
-      const accepted = pick(which)
-      for (const msg of accepted) {
-        queue.push(msg)
-      }
-      if (accepted.length > 0) await persistHeld()
-      return accepted
+      return withEndpointLock(() => {
+        expireHeldRecordsLocked()
+        refreshHeld()
+        const used = stateFileCount("queued") + stateFileCount("inflight")
+        const accepted = pick(which, Math.max(0, opts.maxQueue - used))
+        for (const msg of accepted) {
+          const { heldAt: _heldAt, expiresAt: _expiresAt, ...message } = msg
+          const record = readRecord("held", msg)
+          persistRecord(queuedFile(message), {
+            ...(record ?? { version: 2, acceptedAt: Date.now(), sequence: nextSequence() }),
+            state: "queued",
+            message,
+            heldAt: undefined,
+            expiresAt: undefined,
+            ack: undefined,
+          })
+          unlinkSync(heldFile(msg))
+          syncDirectory(dirname(heldFile(msg)))
+        }
+        refreshQueue()
+        refreshHeld()
+        return accepted
+      })
     },
 
     async dropHeld(which) {
-      const dropped = pick(which)
-      if (dropped.length > 0) await persistHeld()
-      return dropped.length
+      return withEndpointLock(() => {
+        expireHeldRecordsLocked()
+        refreshHeld()
+        const dropped = pick(which)
+        for (const message of dropped) finish(message, "held", "dropped")
+        refreshHeld()
+        return dropped.length
+      })
     },
 
     async loadHeld() {
-      try {
-        const raw = await readFile(opts.inboxFile, "utf8")
-        const parsed = JSON.parse(raw)
-        if (Array.isArray(parsed)) held = parsed as HeldMessage[]
-      } catch {
-        // missing or corrupt inbox starts empty
-      }
+      withEndpointLock(() => {
+        const inflightDir = join(spoolDir, "inflight")
+        for (const record of stateRecords("inflight")) {
+          const message = record.message as InboundMessage
+          if (!readRecord("done", message)) {
+            persistRecord(queuedFile(message), { ...record, state: "queued", message })
+          }
+          unlinkSync(inflightFile(message))
+          syncDirectory(inflightDir)
+        }
+
+        const cutoff = Date.now() - COMPLETED_DEDUPE_RETENTION_MS
+        for (const record of stateRecords("done")) {
+          if (typeof record.ack?.acknowledgedAt === "number" && record.ack.acknowledgedAt <= cutoff) {
+            unlinkSync(doneFile(record.message))
+          }
+        }
+
+        refreshQueue()
+        refreshHeld()
+
+        try {
+          renameSync(opts.inboxFile, `${opts.inboxFile}.legacy-${Date.now()}`)
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+            void opts.logger("warn", "failed to archive legacy inbox", { error: String(err) })
+          }
+        }
+      })
+    },
+
+    withExclusiveLock(operation) {
+      return withEndpointLock(operation)
     },
   }
+  return instance
 }
 
 /** Per-key sliding-window rate limiter. */

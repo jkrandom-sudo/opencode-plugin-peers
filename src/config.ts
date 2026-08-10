@@ -6,14 +6,17 @@ export interface ResolvedConfig {
   storageDir: string
   peersDir: string
   inboxFile: string
+  spoolDir: string
   name: string | undefined
-  inboundPolicy: "accept" | "hold" | "refuse"
+  inboundPolicy: "accept" | "auto" | "hold" | "refuse"
   peerPermissions: PeerPermissionMode
   heartbeatMs: number
   staleMs: number
   maxQueue: number
   maxHeld: number
   maxMessageBytes: number
+  heldExpiryMs: number
+  maxMessageAgeMs: number
   sendRatePerMin: number
   recvRatePerMin: number
   sweepMs: number
@@ -35,6 +38,7 @@ export function resolveConfig(
     storageDir,
     peersDir: join(storageDir, "peers.d"),
     inboxFile: join(storageDir, "inbox.json"),
+    spoolDir: join(storageDir, "spool"),
     name: opts?.name,
     inboundPolicy: opts?.inboundPolicy ?? "accept",
     peerPermissions: opts?.peerPermissions ?? "allow",
@@ -43,6 +47,8 @@ export function resolveConfig(
     maxQueue: opts?.maxQueue ?? 50,
     maxHeld: opts?.maxHeld ?? 100,
     maxMessageBytes: opts?.maxMessageBytes ?? 8192,
+    heldExpiryMs: opts?.heldExpiryMs ?? 300_000,
+    maxMessageAgeMs: opts?.maxMessageAgeMs ?? 300_000,
     sendRatePerMin: opts?.sendRatePerMin ?? 10,
     recvRatePerMin: opts?.recvRatePerMin ?? 20,
     sweepMs: opts?.sweepMs ?? 15_000,

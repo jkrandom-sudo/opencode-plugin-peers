@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtemp, rm, readdir } from "node:fs/promises"
+import { mkdtemp, rm, readdir, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { handlePeersCommand } from "../dist/commands.js"
@@ -38,6 +38,7 @@ async function makeCtx(dir) {
     selfInstanceId: "self1234",
     _dyn: dyn,
     _flushes: flushes,
+    outbox: { list: () => [] },
   }
   return ctx
 }
@@ -48,6 +49,38 @@ const msg = (id) => ({
   text: `held text ${id}`,
   via: ["bbbb2222"],
   sentAt: Date.now(),
+})
+
+test("/peers-outbox distinguishes receipt from final delivery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
+  try {
+    const ctx = await makeCtx(dir)
+    ctx.selfEndpointId = "session-alpha"
+    ctx.outbox.list = () => [{
+      messageId: "m1", toName: "beta", toEndpointId: "session-beta", text: "hello",
+      createdAt: Date.now(), updatedAt: Date.now(), receiptStatus: "held",
+    }]
+    const result = await handlePeersCommand(ctx, "peers-outbox", "")
+    assert.match(result.message, /m1/)
+    assert.match(result.message, /receipt: held/)
+    assert.match(result.message, /awaiting final ACK/)
+    await ctx.registry.stop()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("/peers-inbox lists expiry timestamps", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
+  try {
+    const ctx = await makeCtx(dir)
+    await ctx.queue.hold(msg("expiry"))
+    const result = await handlePeersCommand(ctx, "peers-inbox", "")
+    assert.match(result.message, /expires/i)
+    await ctx.registry.stop()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test("/peers shows an empty Claude-Code-style session list", async () => {
@@ -107,6 +140,31 @@ test("/peers-inbox list/accept/drop flow", async () => {
   }
 })
 
+test("/peers-inbox reports immediate-delivery retry without claiming an idle wait", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
+  try {
+    const ctx = await makeCtx(dir)
+    ctx.delivery.flush = async () => false
+    await ctx.queue.hold(msg("retry"))
+
+    const accepted = await handlePeersCommand(ctx, "peers-inbox", "accept 1")
+    assert.match(accepted.message, /queued for immediate-delivery retry/i)
+    assert.match(accepted.message, /final ACK remains pending/i)
+    assert.doesNotMatch(accepted.message, /until the session is idle/i)
+    await ctx.registry.stop()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("README describes busy delivery as immediate rather than idle-gated", async () => {
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8")
+  assert.doesNotMatch(readme, /queues until it finishes/i)
+  assert.doesNotMatch(readme, /once its session is idle/i)
+  assert.match(readme, /injected immediately[^\n]*busy/i)
+  assert.match(readme, /pending final ACK/i)
+})
+
 test("/list-agents is an alias of /peers", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
   try {
@@ -116,6 +174,46 @@ test("/list-agents is an alias of /peers", async () => {
     assert.equal(alias.handled, true)
     // identical listing body, both prefixed with the same emoji marker
     assert.equal(alias.message, peers.message)
+    await ctx.registry.stop()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("/peers excludes the current command session endpoint", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peers-cmd-"))
+  try {
+    const ctx = await makeCtx(dir)
+    const now = Date.now()
+    const entry = (instanceId, name) => ({
+      version: 1,
+      instanceId,
+      name,
+      pid: process.pid,
+      hostname: "localhost",
+      directory: `/tmp/${name}`,
+      serverUrl: "",
+      inboxUrl: "http://127.0.0.1:1",
+      inboxToken: "token",
+      activeSessionId: instanceId,
+      activeSessionTitle: name,
+      busy: false,
+      queuedCount: 0,
+      inboundPolicy: "accept",
+      startedAt: now,
+      heartbeatAt: now,
+      pluginVersion: "0.1.7",
+    })
+    ctx.selfEndpointId = "session-current"
+    ctx.registry.list = async () => [
+      { entry: entry("session-current", "current-session"), alive: true, staleReason: null },
+      { entry: entry("session-other", "other-session"), alive: true, staleReason: null },
+    ]
+
+    const result = await handlePeersCommand(ctx, "peers", "")
+    assert.match(result.message, /Other Opencode sessions \(1\)/)
+    assert.match(result.message, /other-session/)
+    assert.doesNotMatch(result.message, /current-session/)
     await ctx.registry.stop()
   } finally {
     await rm(dir, { recursive: true, force: true })

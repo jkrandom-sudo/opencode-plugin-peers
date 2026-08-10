@@ -48,6 +48,18 @@ function makeApi(over = {}) {
     ui: {
       toast: (t) => toasts.push(t),
       dialog: { open: over.dialogOpen ?? false },
+      DialogSelect: async (props) => {
+        calls.push({ kind: "select", props })
+        return Object.prototype.hasOwnProperty.call(over, "selectResult") ? over.selectResult : "list"
+      },
+      DialogPrompt: async (props) => {
+        calls.push({ kind: "prompt", props })
+        return over.promptResult ?? null
+      },
+      DialogConfirm: async (props) => {
+        calls.push({ kind: "confirm", props })
+        return over.confirmResult ?? false
+      },
     },
     lifecycle: { onDispose: (fn) => disposers.push(fn) },
     ...("route" in over
@@ -83,7 +95,7 @@ test("module shape matches the TUI plugin loader contract", () => {
   assert.equal("server" in mod, false) // loader rejects server+tui in one default export
 })
 
-test("tui() registers four palette commands WITHOUT slashName (no duplicate autocomplete rows)", async () => {
+test("tui() registers five palette commands WITHOUT slashName (no duplicate autocomplete rows)", async () => {
   const { api, calls } = makeApi()
   await mod.tui(api)
   const reg = calls.filter((c) => c.kind === "registerLayer")
@@ -94,6 +106,7 @@ test("tui() registers four palette commands WITHOUT slashName (no duplicate auto
     "opencode-plugin-peers.list-agents",
     "opencode-plugin-peers.peers-name",
     "opencode-plugin-peers.peers-inbox",
+    "opencode-plugin-peers.peers-outbox",
   ])
   for (const c of commands) {
     assert.equal(c.namespace, "palette")
@@ -103,12 +116,41 @@ test("tui() registers four palette commands WITHOUT slashName (no duplicate auto
   }
 })
 
-test("palette command run() still executes the server command", async () => {
-  const { api, calls } = makeApi()
+test("palette peer list requires an explicit selection before executing", async () => {
+  const cancelled = makeApi({ selectResult: null })
+  await mod.tui(cancelled.api)
+  const cancelledPeers = cancelled.calls[0].layer.commands.find((c) => c.name === "opencode-plugin-peers.peers")
+  await cancelledPeers.run()
+  assert.equal(cancelled.calls.filter((c) => c.kind === "command").length, 0)
+
+  const { api, calls } = makeApi({ selectResult: "list" })
   await mod.tui(api)
   const peers = calls[0].layer.commands.find((c) => c.name === "opencode-plugin-peers.peers")
   await peers.run()
-  assert.deepEqual(calls[1], { kind: "command", args: { sessionID: "ses_1", command: "peers", arguments: "" } })
+  assert.deepEqual(calls.find((c) => c.kind === "command"), { kind: "command", args: { sessionID: "ses_1", command: "peers", arguments: "" } })
+})
+
+test("palette held-message drop requires action, target, and confirmation", async () => {
+  const { api, calls } = makeApi({ selectResult: "drop", promptResult: "2", confirmResult: true })
+  await mod.tui(api)
+  const inbox = calls[0].layer.commands.find((c) => c.name === "opencode-plugin-peers.peers-inbox")
+  await inbox.run()
+  assert.ok(calls.some((c) => c.kind === "select"))
+  assert.ok(calls.some((c) => c.kind === "prompt"))
+  assert.ok(calls.some((c) => c.kind === "confirm"))
+  assert.deepEqual(calls.find((c) => c.kind === "command").args, {
+    sessionID: "ses_1", command: "peers-inbox", arguments: "drop 2",
+  })
+})
+
+test("palette rename requires entered name and confirmation", async () => {
+  const { api, calls } = makeApi({ promptResult: "frontend", confirmResult: true })
+  await mod.tui(api)
+  const rename = calls[0].layer.commands.find((c) => c.name === "opencode-plugin-peers.peers-name")
+  await rename.run()
+  assert.deepEqual(calls.find((c) => c.kind === "command").args, {
+    sessionID: "ses_1", command: "peers-name", arguments: "frontend",
+  })
 })
 
 test("Enter on exact command text executes immediately and clears the prompt", async () => {

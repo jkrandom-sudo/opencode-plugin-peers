@@ -12,6 +12,7 @@ test("resolveConfig applies defaults", () => {
   assert.equal(cfg.storageDir, "/xdg/opencode-plugin-peers")
   assert.equal(cfg.peersDir, "/xdg/opencode-plugin-peers/peers.d")
   assert.equal(cfg.inboxFile, "/xdg/opencode-plugin-peers/inbox.json")
+  assert.equal(cfg.spoolDir, "/xdg/opencode-plugin-peers/spool")
   assert.equal(cfg.inboundPolicy, "accept")
   assert.equal(cfg.peerPermissions, "allow")
   assert.equal(cfg.heartbeatMs, 10_000)
@@ -19,9 +20,16 @@ test("resolveConfig applies defaults", () => {
   assert.equal(cfg.maxQueue, 50)
   assert.equal(cfg.maxHeld, 100)
   assert.equal(cfg.maxMessageBytes, 8192)
+  assert.equal(cfg.heldExpiryMs, 300000)
+  assert.equal(cfg.maxMessageAgeMs, 300000)
   assert.equal(cfg.sendRatePerMin, 10)
   assert.equal(cfg.recvRatePerMin, 20)
   assert.equal(cfg.sweepMs, 15_000)
+})
+
+test("resolveConfig accepts the additional auto inbound policy without changing the default", () => {
+  assert.equal(resolveConfig(undefined, {}).inboundPolicy, "accept")
+  assert.equal(resolveConfig({ inboundPolicy: "auto" }, {}).inboundPolicy, "auto")
 })
 
 test("resolveConfig merges user options", () => {

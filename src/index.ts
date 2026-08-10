@@ -8,7 +8,7 @@
  *   - list_agents / send_message tools for the agent
  *   - /peers, /peers-name, /peers-inbox commands for the user
  *   - accept/hold/refuse inbound gating
- *   - busy sessions queue messages; delivery happens on session.idle
+ *   - each session is independently addressable and receives peer messages immediately
  *   - messages are ordinary (synthetic) user messages: no shared history,
  *     no file transfer; permissions in peer-triggered turns are governed
  *     by the peerPermissions option (default: auto-allow)
@@ -17,7 +17,7 @@
  * $XDG_DATA_HOME/opencode-plugin-peers/peers.d/ and runs a 127.0.0.1-only
  * inbox HTTP listener (random port, bearer token). Peers POST to the
  * listener; the receiving instance injects into its own session via the
- * opencode SDK when idle.
+ * opencode SDK immediately, including while the target session is busy.
  */
 
 import { basename } from "node:path"
@@ -25,19 +25,65 @@ import type { Hooks, Plugin, PluginModule } from "@opencode-ai/plugin"
 import { resolveConfig } from "./config.js"
 import { Registry, newInboxToken, newInstanceId, uniqueName } from "./registry.js"
 import { InboxListener } from "./listener.js"
-import { MessageQueue, RateLimiter } from "./queue.js"
-import { SessionTracker } from "./session-tracker.js"
-import { Delivery } from "./delivery.js"
+import { RateLimiter } from "./queue.js"
+import type { QueueInstance } from "./queue.js"
+import { SessionRuntime } from "./session-runtime.js"
+import type { DeliveryInstance } from "./delivery.js"
 import { Sender } from "./sender.js"
-import { gateMessage } from "./gating.js"
+import { LocalTransport } from "./transport.js"
+import { Outbox } from "./outbox.js"
 import { PeerPermissions } from "./permissions.js"
 import { buildPeerTools } from "./tools/peers-tools.js"
 import { handlePeersCommand } from "./commands.js"
 import { consumeCommand, createLogger, errorMessage } from "./feedback.js"
 import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 
-const PLUGIN_VERSION = "0.1.7"
-const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox"])
+const PLUGIN_VERSION = "0.2.0"
+const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox", "peers-outbox"])
+
+/**
+ * Command definitions injected through the `config` hook. opencode 1.18 does
+ * NOT scan plugin packages for commands/*.md, so without this a fresh install
+ * has no /peers* commands at all (the shipped commands/ directory only serves
+ * users who copy it into their config dir). User-defined commands with the
+ * same name always win.
+ */
+const INJECTED_COMMANDS: Record<string, { description: string; template: string }> = {
+  peers: {
+    description: "List same-machine opencode peers you can exchange messages with (cross-session messaging)",
+    template:
+      "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, call the list_agents tool and show the result to the user verbatim.",
+  },
+  "list-agents": {
+    description:
+      "List same-machine opencode peers you can exchange messages with (alias of /peers, compatible with Claude Code's /list-agents)",
+    template:
+      "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, call the list_agents tool and show the result to the user verbatim.",
+  },
+  "peers-name": {
+    description: "Show or set this instance's peer name (used by other sessions to address you)",
+    template:
+      "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, tell the user the plugin is not loaded and no action was taken.",
+  },
+  "peers-inbox": {
+    description: "Review held peer messages. Usage: /peers-inbox [accept <n|all> | drop <n|all>]",
+    template:
+      "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, tell the user the plugin is not loaded and no action was taken.",
+  },
+  "peers-outbox": {
+    description: "Show transport receipts and final ACK outcomes for messages sent by this session",
+    template:
+      "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, tell the user the plugin is not loaded and no action was taken.",
+  },
+}
+
+export async function runReliabilitySweep(
+  queue: QueueInstance,
+  delivery: Pick<DeliveryInstance, "flush">
+): Promise<void> {
+  await queue.expireHeld()
+  await delivery.flush()
+}
 
 export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   const logger = createLogger(ctx.client)
@@ -50,51 +96,82 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
 
   const instanceId = newInstanceId()
   const inboxToken = newInboxToken()
-  const tracker = SessionTracker()
-  const queue = MessageQueue({
-    maxQueue: config.maxQueue,
-    maxHeld: config.maxHeld,
-    inboxFile: config.inboxFile,
-    logger,
-  })
-  await queue.loadHeld()
 
   let currentName = config.name || basename(ctx.directory) || "opencode"
   let policy: InboundPolicy = config.inboundPolicy
-
-  const delivery = Delivery({
+  const runtime = SessionRuntime({
     client: ctx.client,
-    tracker,
-    queue,
+    config,
     directory: ctx.directory,
+    name: () => currentName,
     logger,
   })
 
   const recvLimit = RateLimiter(config.recvRatePerMin)
   const sendLimit = RateLimiter(config.sendRatePerMin)
+  const outbox = Outbox({ storageDir: config.storageDir })
+  let dispatchAcknowledgements: () => Promise<void> = async () => {}
 
   const listener = InboxListener({
     token: inboxToken,
     maxBodyBytes: config.maxMessageBytes * 2 + 4096,
-    logger,
-    onMessage: async (msg): Promise<ReceiveStatus> => {
-      if (!recvLimit(msg.from.instanceId)) return "full"
-      const decision = gateMessage(policy, msg)
-      if (decision === "refuse") return "refused"
-      if (decision === "hold") {
-        const ok = await queue.hold(msg)
-        if (!ok) return "full"
-        // Fire-and-forget: inbound handling must not block on UX feedback.
-        void delivery.notice(`📥 Held message from "${msg.from.name}" — /peers-inbox to review`)
-        return "held"
+    maxMessageBytes: config.maxMessageBytes,
+    maxMessageAgeMs: config.maxMessageAgeMs,
+    processId: instanceId,
+    resolveEndpoint: async ({ version, toEndpointId }) => {
+      const resolve = () =>
+        version === 1
+          ? runtime.compatibilityEndpointId()
+          : toEndpointId && runtime.hasEndpoint(toEndpointId)
+            ? toEndpointId
+            : null
+      const immediate = resolve()
+      if (immediate) return immediate
+      // Startup window: the listener is up before deferred session discovery
+      // finishes. Wait (bounded) for it instead of returning a terminal 404
+      // for an endpoint that exists moments later.
+      let timeout: ReturnType<typeof setTimeout> | null = null
+      try {
+        await Promise.race([
+          runtime.whenReady(),
+          new Promise<void>((res) => {
+            timeout = setTimeout(res, 10_000)
+            timeout.unref?.()
+          }),
+        ])
+      } finally {
+        if (timeout) clearTimeout(timeout)
       }
-      if (!queue.enqueue(msg)) return "full"
-      const delivered = await delivery.flush()
-      return delivered ? "delivered" : "queued"
+      return resolve()
+    },
+    logger,
+    onMessage: async (msg, endpointId): Promise<ReceiveStatus> => {
+      if (!recvLimit(msg.from.instanceId)) return "full"
+      const status = await runtime.receive(msg, endpointId!, policy)
+      // Fire-and-forget, but never let a rejection escape: an unhandled
+      // rejection would crash the host opencode process.
+      void dispatchAcknowledgements().catch((err) =>
+        logger("warn", "acknowledgement dispatch failed; will retry", { error: String(err) })
+      )
+      return status
+    },
+    onAcknowledgement: async (acknowledgement) => {
+      if (!(await outbox.applyAcknowledgement(acknowledgement))) {
+        await logger("warn", "ignored unmatched peer acknowledgement", {
+          messageId: acknowledgement.messageId,
+          fromEndpointId: acknowledgement.fromEndpointId,
+          toEndpointId: acknowledgement.toEndpointId,
+        })
+      }
     },
   })
 
-  const { url: inboxUrl } = await listener.start()
+  const { url: transportUrl, compatibilityUrl: inboxUrl, address: transport } = await listener.start()
+
+  const latestEndpoint = () => {
+    const compatibilityId = runtime.compatibilityEndpointId()
+    return runtime.registryEndpoints().find((endpoint) => endpoint.endpointId === compatibilityId)
+  }
 
   const registry = Registry({
     peersDir: config.peersDir,
@@ -107,29 +184,47 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     pluginVersion: PLUGIN_VERSION,
     heartbeatMs: config.heartbeatMs,
     staleMs: config.staleMs,
-    getDynamic: () => ({
-      name: currentName,
-      inboundPolicy: policy,
-      activeSessionId: tracker.activeSessionId(),
-      activeSessionTitle: tracker.activeSessionTitle(),
-      busy: tracker.activeSessionId() != null && !tracker.isIdle(),
-      queuedCount: queue.size(),
-    }),
+    getDynamic: () => {
+      const latest = latestEndpoint()
+      return {
+        name: currentName,
+        inboundPolicy: policy,
+        activeSessionId: latest?.sessionId ?? null,
+        activeSessionTitle: latest?.title ?? null,
+        busy: latest ? latest.status !== "idle" : false,
+        queuedCount: latest?.queuedCount ?? 0,
+      }
+    },
+    getEndpoints: runtime.registryEndpoints,
+    getCompatibilityEndpointId: runtime.compatibilityEndpointId,
+    transport,
+    peerPermissions: config.peerPermissions,
     logger,
   })
 
-  // Resolve name conflicts before announcing ourselves.
-  const unique = uniqueName(currentName, await registry.list())
-  if (unique.changed) {
-    // No session exists yet at init, so there is no inline channel — the
-    // final name is visible via /peers.
-    await logger("info", `name "${currentName}" was taken; registered as "${unique.name}"`, {
-      requested: currentName,
-      assigned: unique.name,
-    })
-    currentName = unique.name
-  }
   await registry.start()
+
+  const acknowledgementTransport = LocalTransport()
+  dispatchAcknowledgements = async (): Promise<void> => {
+    const pending = runtime.pendingAcknowledgements()
+    if (pending.length === 0) return
+    const peers = await registry.list()
+    for (const { queue, acknowledgement } of pending) {
+      const target = peers.find((peer) => peer.alive && peer.entry.version === 2 &&
+        peer.entry.endpointId === acknowledgement.fromEndpointId)?.entry
+      if (!target || target.version !== 2) continue
+      try {
+        await acknowledgementTransport.ack(target, acknowledgement)
+        await queue.markAcknowledgementSent(acknowledgement)
+      } catch (err) {
+        await logger("warn", "failed to return peer acknowledgement; will retry", {
+          error: String(err),
+          messageId: acknowledgement.messageId,
+          senderEndpointId: acknowledgement.fromEndpointId,
+        })
+      }
+    }
+  }
 
   const sender = Sender({
     self: {
@@ -141,13 +236,16 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
       },
       directory: ctx.directory,
     },
+    outbox,
   })
 
-  const flushIfIdle = async (): Promise<void> => {
+  const sweepReliability = async (): Promise<void> => {
+    if (disposing) return
     try {
-      await delivery.flush()
+      await runtime.sweep()
+      await dispatchAcknowledgements()
     } catch (err) {
-      await logger("error", "flush failed", { error: errorMessage(err) })
+      await logger("error", "reliability sweep failed", { error: errorMessage(err) })
     }
   }
 
@@ -157,42 +255,50 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     directory: ctx.directory,
     logger,
   })
+  let disposing = false
+  let disposePromise: Promise<void> | null = null
+  let discoveryTimer: ReturnType<typeof setTimeout> | null = null
 
   // Fallback sweep: session.idle is not guaranteed on every version/scenario,
   // so poll idle state periodically as a safety net.
   const sweeper = setInterval(() => {
-    flushIfIdle()
+    void sweepReliability()
   }, config.sweepMs)
   sweeper.unref?.()
 
   const hooks: Hooks = {
-    event: async ({ event }) => {
-      const e = event as { type?: string; properties?: Record<string, unknown> }
-      const sid = (e.properties?.sessionID ?? e.properties?.sessionId) as string | undefined
-      switch (e.type) {
-        case "session.idle":
-          tracker.noteIdle(sid)
-          await flushIfIdle()
-          break
-        case "session.created":
-          if (sid && !tracker.activeSessionId()) tracker.noteIdle(sid)
-          break
-        case "session.deleted":
-          if (sid) tracker.noteDeleted(sid)
-          break
-        default:
-          await permissions.handleEvent(e)
-          break
+    config: async (input) => {
+      // Register our slash commands server-side; without this a fresh install
+      // has no /peers* commands (opencode does not scan plugin packages for
+      // commands/*.md). Never override a user-defined command.
+      input.command = input.command ?? {}
+      for (const [name, definition] of Object.entries(INJECTED_COMMANDS)) {
+        input.command[name] ??= definition
       }
     },
 
+    event: async ({ event }) => {
+      if (disposing) return
+      const e = event as { type?: string; properties?: Record<string, unknown> }
+      const changed = await runtime.handleEvent(e)
+      if (changed && !disposing) await registry.heartbeat()
+      if (disposing) return
+      await permissions.handleEvent(e)
+    },
+
     "chat.message": async (input) => {
-      tracker.noteUserActivity(input.sessionID)
+      if (disposing) return
+      await runtime.noteActivity(input.sessionID)
+      if (!disposing) await registry.heartbeat()
     },
 
     "command.execute.before": async (input, output) => {
+      if (disposing) return
       if (!COMMAND_NAMES.has(input.command)) return
-      tracker.noteUserActivity(input.sessionID)
+      await runtime.noteActivity(input.sessionID)
+      const queue = runtime.queueForSession(input.sessionID)
+      const delivery = runtime.deliveryForSession(input.sessionID)
+      if (!queue || !delivery) return
       let message: string
       try {
         const result = await handlePeersCommand(
@@ -202,17 +308,19 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
             delivery,
             getName: () => currentName,
             setName: async (name) => {
-              const u = uniqueName(name, await registry.list())
-              currentName = u.name
+              currentName = name
               await registry.heartbeat()
-              return u
+              return { name, changed: false }
             },
             selfInstanceId: instanceId,
+            selfEndpointId: runtime.endpointIdForSession(input.sessionID) ?? instanceId,
+            outbox,
           },
           input.command,
           input.arguments || ""
         )
         message = result.message ?? "✅ Done."
+        await dispatchAcknowledgements()
       } catch (err) {
         message = `❌ /${input.command} failed: ${errorMessage(err)}`
       }
@@ -230,20 +338,54 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     maxMessageBytes: config.maxMessageBytes,
     selfName: () => currentName,
     selfInstanceId: instanceId,
+    endpointForSession: (sessionId) => {
+      const endpointId = runtime.endpointIdForSession(sessionId)
+      const endpoint = runtime.registryEndpoints().find((entry) => entry.sessionId === sessionId)
+      return endpointId && endpoint
+        ? { endpointId, name: endpoint.name, directory: endpoint.directory }
+        : null
+    },
+    outbox,
   })
 
-  hooks.dispose = async () => {
+  hooks.dispose = () => {
+    if (disposePromise) return disposePromise
+    disposing = true
+    if (discoveryTimer) clearTimeout(discoveryTimer)
+    discoveryTimer = null
     clearInterval(sweeper)
-    await listener.stop()
-    await registry.stop()
+    const registryStopping = registry.stop()
+    const runtimeStopping = runtime.stop()
+    disposePromise = Promise.all([
+      registryStopping,
+      runtimeStopping,
+      listener.stop(),
+      acknowledgementTransport.close(),
+    ]).then(() => undefined)
+    return disposePromise
   }
 
   await logger("info", "opencode-plugin-peers started", {
     instanceId,
     name: currentName,
     inboxUrl,
+    transportUrl,
     policy,
   })
+
+  // OpenCode constructs plugins while servicing the first session request.
+  // Calling this server's session API before returning hooks deadlocks that
+  // request, so discover pre-existing sessions only after bootstrap unwinds.
+  discoveryTimer = setTimeout(() => {
+    discoveryTimer = null
+    if (disposing) return
+    void runtime.initialize()
+      .then(async () => {
+        if (!disposing) await registry.heartbeat()
+      })
+      .catch((err) => logger("warn", "deferred session discovery failed", { error: String(err) }))
+  }, 0)
+  discoveryTimer.unref?.()
 
   return hooks
 }
@@ -257,13 +399,30 @@ export const plugin: PluginModule = {
 export default plugin
 
 export { Registry, uniqueName } from "./registry.js"
-export { MessageQueue, RateLimiter } from "./queue.js"
+export {
+  MessageQueue,
+  RateLimiter,
+  createProcessMessageQueue,
+  createSessionMessageQueue,
+  migrateWorkspaceSpool,
+  stableSessionEndpointId,
+  stableSpoolEndpointId,
+} from "./queue.js"
 export { SessionTracker } from "./session-tracker.js"
-export { Delivery, formatMessages } from "./delivery.js"
-export { Sender, buildMessage } from "./sender.js"
+export { SessionRuntime } from "./session-runtime.js"
+export { Delivery, deterministicPeerMessageId, formatMessages } from "./delivery.js"
+export { Sender, buildMessage, buildMessageV2 } from "./sender.js"
 export { InboxListener } from "./listener.js"
+export { LocalTransport } from "./transport.js"
+export type {
+  LocalTransportOptions,
+  Transport,
+  TransportResponse,
+  TransportTarget,
+} from "./transport.js"
 export { gateMessage } from "./gating.js"
-export { PeerPermissions } from "./permissions.js"
+export { PeerPermissions, isProtectedPermission } from "./permissions.js"
+export { Outbox } from "./outbox.js"
 export { formatSessionList, relativeAge } from "./format.js"
 export { resolveConfig, validateName } from "./config.js"
 export * from "./types.js"
