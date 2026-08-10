@@ -356,3 +356,39 @@ test("registry stop rejects late heartbeats and leaves no republished files", as
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test("heartbeat prunes v2 files for endpoints no longer published", async () => {
+  const dir = await makeDir()
+  try {
+    const endpoint = (id) => ({
+      endpointId: `session-${id}`,
+      sessionId: `ses_${id}`,
+      title: id,
+      name: "project",
+      directory: "/tmp/proj",
+      status: "idle",
+      startedAt: 100,
+      updatedAt: 200,
+      queuedCount: 0,
+    })
+    let published = [endpoint("alpha"), endpoint("beta")]
+    const reg = makeRegistry(dir, dyn, {
+      instanceId: "process-prune",
+      getEndpoints: () => published,
+      getCompatibilityEndpointId: () => "session-alpha",
+      transport: { type: "unix", path: "/tmp/ocp-501/process-prune.sock" },
+      peerPermissions: "allow",
+    })
+    await reg.start()
+    assert.equal((await readdir(dir)).filter((f) => f.endsWith(".v2.json")).length, 2)
+
+    // beta stops being published (session deleted / no longer active)
+    published = [endpoint("alpha")]
+    await reg.heartbeat()
+    const files = await readdir(dir)
+    assert.deepEqual(files.filter((f) => f.endsWith(".v2.json")), ["process-prune.session-alpha.v2.json"])
+    await reg.stop()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

@@ -50,13 +50,14 @@ test("formatSessionList renders Claude-Code-style rows", () => {
   )
   const lines = out.split("\n")
   assert.equal(lines[0], "Other Opencode sessions (2):")
+  // rows are sorted by startedAt ascending (deterministic across heartbeats)
   assert.equal(
     lines[1],
-    "  [waiting]  ·  opencode-plugin-peers-0a  ·  /Users/w/opencode-plugin-peers  ·  started 9m ago"
+    "  [idle]  ·  upstream-3a  ·  /Users/w/upstream  ·  started 29m ago"
   )
   assert.equal(
     lines[2],
-    "  [idle]  ·  upstream-3a  ·  /Users/w/upstream  ·  started 29m ago"
+    "  [waiting]  ·  opencode-plugin-peers-0a  ·  /Users/w/opencode-plugin-peers  ·  started 9m ago"
   )
 })
 
@@ -89,4 +90,20 @@ test("formatSessionList: empty online list and stale summary", () => {
     out,
     "No other opencode sessions online.\n1 stale/offline (hidden from targeting)."
   )
+})
+
+test("formatSessionList sorts online rows deterministically regardless of input order", () => {
+  const a = peer({ entry: { ...peer().entry, name: "zed", instanceId: "zzz", startedAt: NOW - 1000 } })
+  const b = peer({ entry: { ...peer().entry, name: "mid", instanceId: "mmm", startedAt: NOW - 5000 } })
+  const c = peer({ entry: { ...peer().entry, name: "first", instanceId: "aaa", startedAt: NOW - 9000 } })
+  // same startedAt as c but a later id — must sort after c
+  const d = peer({ entry: { ...peer().entry, name: "tiebreak", instanceId: "bbb", startedAt: NOW - 9000 } })
+  const shuffled = [a, b, d, c]
+  const one = formatSessionList(shuffled, NOW)
+  const two = formatSessionList([c, d, b, a], NOW)
+  assert.equal(one, two)
+  const order = [c, d, b, a].map((p) => p.entry.name)
+  const positions = order.map((name) => one.indexOf(`  [idle]  ·  ${name}`))
+  assert.ok(positions.every((pos) => pos > 0), one)
+  assert.deepEqual([...positions].sort((x, y) => x - y), positions)
 })

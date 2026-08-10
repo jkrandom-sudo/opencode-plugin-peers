@@ -38,7 +38,7 @@ import { handlePeersCommand } from "./commands.js"
 import { consumeCommand, createLogger, errorMessage } from "./feedback.js"
 import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 
-const PLUGIN_VERSION = "0.2.0"
+const PLUGIN_VERSION = "0.2.1"
 const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox", "peers-outbox"])
 
 /**
@@ -404,6 +404,7 @@ export {
   RateLimiter,
   createProcessMessageQueue,
   createSessionMessageQueue,
+  hasSpoolRecords,
   migrateWorkspaceSpool,
   stableSessionEndpointId,
   stableSpoolEndpointId,

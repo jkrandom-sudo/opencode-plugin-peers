@@ -4,6 +4,7 @@ import { Delivery, type DeliveryInstance } from "./delivery.js"
 import { gateMessage } from "./gating.js"
 import {
   createSessionMessageQueue,
+  hasSpoolRecords,
   migrateWorkspaceSpool,
   stableSessionEndpointId,
   type QueueInstance,
@@ -205,10 +206,44 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
             logger: opts.logger,
           })
         }
-        for (const session of sessions) {
-          await upsert(session, normalizeStatus(statuses[session.id]))
+        // Adopt only sessions that are alive IN THIS PROCESS:
+        //  - non-idle in the status snapshot (a real server keeps only
+        //    busy/retry entries there, children included), or
+        //  - holding undelivered peer state in their durable spool (restart
+        //    recovery; done/ records alone do not count).
+        // Historical sessions from session.list() stay unpublished until real
+        // activity arrives via events, chat.message, or commands.
+        const listed = new Map(sessions.map((candidate) => [candidate.id, candidate]))
+        for (const [sessionId, raw] of Object.entries(statuses)) {
+          const status = normalizeStatus(raw)
+          if (status === "idle") continue
+          let session = listed.get(sessionId)
+          if (!session) {
+            // busy child of an idle/historical root: not in the root list
+            try {
+              const response = await opts.client.session.get({
+                path: { id: sessionId },
+                query: { directory: opts.directory },
+              })
+              session = responseData<OpenCodeSession>(response)
+            } catch {
+              session = undefined
+            }
+          }
+          if (session) await upsert(session, status)
         }
-        for (const session of sessions) await loadChildren(session, statuses)
+        for (const session of sessions) {
+          if (endpoints.has(session.id)) continue
+          if (hasSpoolRecords(opts.config, session.id)) {
+            const endpoint = await upsert(session, normalizeStatus(statuses[session.id]))
+            // Restart recovery: deliver what the previous run could not.
+            await endpoint.delivery.flush()
+          }
+        }
+        // No startup child traversal: busy children are already covered by the
+        // flat status snapshot, and anything else becomes visible through
+        // session.created/updated events. Traversing children of adopted
+        // roots would re-adopt idle historical subagent sessions.
       }).finally(() => markReady())
     },
 

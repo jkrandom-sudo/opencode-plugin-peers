@@ -51,6 +51,25 @@ export function stableSessionEndpointId(sessionId: string): string {
   return `session-${digest.slice(0, 24)}`
 }
 
+/**
+ * True when the session's durable spool holds any records — undelivered
+ * (queued/held/inflight) or delivered (done, retained 24h for dedupe).
+ * Startup adopts exactly these sessions (plus snapshot-busy ones): pending
+ * work must resume, and done records must load or a post-restart retry would
+ * deliver a duplicate. Everything else stays unpublished until real activity.
+ */
+export function hasSpoolRecords(config: ResolvedConfig, sessionId: string): boolean {
+  const spoolDir = join(config.spoolDir, stableSessionEndpointId(sessionId))
+  for (const state of ["queued", "held", "inflight", "done"] as const) {
+    try {
+      if (readdirSync(join(spoolDir, state)).some((file) => file.endsWith(".json"))) return true
+    } catch {
+      // missing state dir — no records of this state
+    }
+  }
+  return false
+}
+
 export function createSessionMessageQueue(opts: {
   config: ResolvedConfig
   sessionId: string

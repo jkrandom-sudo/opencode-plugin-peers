@@ -30,8 +30,23 @@ function statusTag(peer: ListedPeer): string | null {
   return peer.entry.busy ? "[waiting]" : "[idle]"
 }
 
+function entryKey(peer: ListedPeer): string {
+  return peer.entry.version === 2 ? peer.entry.endpointId : peer.entry.instanceId
+}
+
+/**
+ * Deterministic display order. The registry rewrites entries with atomic
+ * renames every heartbeat, so readdir order shuffles constantly — sorting
+ * here keeps /peers output stable between invocations.
+ */
+export function sortPeers<T extends ListedPeer>(peers: T[]): T[] {
+  return peers.slice().sort((a, b) =>
+    a.entry.startedAt - b.entry.startedAt || entryKey(a).localeCompare(entryKey(b))
+  )
+}
+
 export function formatSessionList(peers: ListedPeer[], now: number): string {
-  const online = peers.filter((p) => p.alive)
+  const online = sortPeers(peers.filter((p) => p.alive))
   const offline = peers.filter((p) => !p.alive)
   const lines: string[] = []
 
