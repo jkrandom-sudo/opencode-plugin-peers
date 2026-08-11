@@ -1,5 +1,5 @@
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 import type { PeerPermissionMode, PluginConfig } from "./types.js"
 
 export interface ResolvedConfig {
@@ -62,4 +62,18 @@ export function validateName(name: string): string | null {
     return "Name must be 1-32 chars of [A-Za-z0-9 _-] (no newlines or symbols)."
   }
   return null
+}
+
+/**
+ * Auto-generate a peer display name in Claude Code's `<dir>-<hex>` pattern
+ * (e.g. `my-app-a3f2`). The suffix is derived from the per-process instanceId
+ * so that two opencode instances opened in the same directory are
+ * distinguishable in /peers and addressable by name without ambiguity.
+ * The total length stays within the 32-char validateName limit.
+ */
+export function defaultPeerName(directory: string, instanceId: string): string {
+  const dirName = basename(directory) || "opencode"
+  const maxBase = 27 // 32 - 5 ("-XXXX")
+  const base = dirName.length > maxBase ? dirName.slice(0, maxBase) : dirName
+  return `${base}-${instanceId.slice(-4)}`
 }

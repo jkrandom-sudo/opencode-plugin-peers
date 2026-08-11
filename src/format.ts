@@ -80,7 +80,16 @@ export function formatSessionList(peers: ListedPeer[], now: number): string {
   } else {
     lines.push(`Other Opencode sessions (${online.length}):`)
     for (const p of online) {
-      const segments = [p.entry.name, p.entry.directory, `started ${relativeAge(p.entry.startedAt, now)}`]
+      const rawTitle = p.entry.activeSessionTitle?.trim()
+      const titleSeg = rawTitle
+        ? `"${rawTitle.length > 40 ? rawTitle.slice(0, 39) + "…" : rawTitle}"`
+        : null
+      const segments = [
+        p.entry.name,
+        ...(titleSeg ? [titleSeg] : []),
+        p.entry.directory,
+        `started ${relativeAge(p.entry.startedAt, now)}`,
+      ]
       const queued = p.entry.queuedCount ?? 0
       if (queued > 0) segments.push(`${queued} queued`)
       const tag = statusTag(p)

@@ -20,9 +20,8 @@
  * opencode SDK immediately, including while the target session is busy.
  */
 
-import { basename } from "node:path"
 import type { Hooks, Plugin, PluginModule } from "@opencode-ai/plugin"
-import { resolveConfig } from "./config.js"
+import { resolveConfig, defaultPeerName } from "./config.js"
 import { Registry, newInboxToken, newInstanceId, uniqueName } from "./registry.js"
 import { InboxListener } from "./listener.js"
 import { RateLimiter } from "./queue.js"
@@ -38,7 +37,7 @@ import { handlePeersCommand } from "./commands.js"
 import { consumeCommand, createLogger, errorMessage } from "./feedback.js"
 import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 
-const PLUGIN_VERSION = "0.2.1"
+const PLUGIN_VERSION = "0.2.2"
 const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox", "peers-outbox"])
 
 /**
@@ -97,7 +96,10 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
   const instanceId = newInstanceId()
   const inboxToken = newInboxToken()
 
-  let currentName = config.name || basename(ctx.directory) || "opencode"
+  // Default name: <dir-name>-<hex4> (matches Claude Code's "my-app-3f" pattern).
+  // Only auto-generated names get the suffix; an explicit config.name or
+  // /peers-name override replaces it entirely, keeping the user's choice.
+  let currentName = config.name || defaultPeerName(ctx.directory, instanceId)
   let policy: InboundPolicy = config.inboundPolicy
   const runtime = SessionRuntime({
     client: ctx.client,
