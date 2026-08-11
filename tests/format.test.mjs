@@ -111,7 +111,7 @@ test("formatSessionList sorts online rows deterministically regardless of input 
 test("collapseToProcesses keeps one row per process (newest session)", () => {
   const proc = (endpointId, startedAt) => peer({}, { version: 2, endpointId, processId: "proc-a", startedAt })
   const other = (endpointId, startedAt) => peer({}, { version: 2, endpointId, processId: "proc-b", startedAt })
-  
+
   const collapsed = collapseToProcesses([
     proc("ep-old", NOW - 9000),
     other("ep-other", NOW - 3000),
@@ -119,4 +119,28 @@ test("collapseToProcesses keeps one row per process (newest session)", () => {
   ])
   assert.equal(collapsed.length, 2)
   assert.deepEqual(collapsed.map((p) => p.entry.endpointId).sort(), ["ep-new", "ep-other"])
+})
+
+test("formatSessionList shows session title between name and directory when present", () => {
+  const out = formatSessionList(
+    [peer({}, { activeSessionTitle: "Fix login bug" })],
+    NOW
+  )
+  assert.match(out, /alpha  ·  "Fix login bug"  ·  \/Users\/x\/proj/)
+})
+
+test("formatSessionList omits title segment when activeSessionTitle is null or empty", () => {
+  const nullOut = formatSessionList([peer({}, { activeSessionTitle: null })], NOW)
+  assert.ok(!nullOut.includes('"·'), `unexpected title in: ${nullOut}`)
+  assert.match(nullOut, /alpha  ·  \/Users\/x\/proj/)
+
+  const emptyOut = formatSessionList([peer({}, { activeSessionTitle: "  " })], NOW)
+  assert.match(emptyOut, /alpha  ·  \/Users\/x\/proj/)
+})
+
+test("formatSessionList truncates long session titles with ellipsis", () => {
+  const longTitle = "A".repeat(50)
+  const out = formatSessionList([peer({}, { activeSessionTitle: longTitle })], NOW)
+  assert.match(out, /"A{39}…"/)
+  assert.ok(!out.includes("A".repeat(50)), "full 50-char title should not appear")
 })

@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { resolveConfig, defaultDataDir, validateName } from "../dist/config.js"
+import { resolveConfig, defaultDataDir, validateName, defaultPeerName } from "../dist/config.js"
 
 test("defaultDataDir honors XDG_DATA_HOME and falls back to ~/.local/share", () => {
   assert.equal(defaultDataDir({ XDG_DATA_HOME: "/xdg" }), "/xdg")
@@ -53,4 +53,32 @@ test("validateName accepts safe names and rejects dangerous ones", () => {
   assert.match(validateName("bad\nname"), /1-32/)
   assert.match(validateName("quote\"name"), /1-32/)
   assert.match(validateName("emoji🤖"), /1-32/)
+})
+
+test("defaultPeerName: appends instanceId hex suffix to directory basename", () => {
+  const name = defaultPeerName("/Users/me/my-app", "a1b2c3d4")
+  assert.equal(name, "my-app-c3d4")
+})
+
+test("defaultPeerName: two instances in the same directory get different suffixes", () => {
+  const a = defaultPeerName("/Users/me/my-app", "a1b2c3d4")
+  const b = defaultPeerName("/Users/me/my-app", "e5f6g7h8")
+  assert.notEqual(a, b)
+  assert.ok(a.startsWith("my-app-"))
+  assert.ok(b.startsWith("my-app-"))
+})
+
+test("defaultPeerName: truncates long directory names to fit 32-char limit", () => {
+  const longDir = "/x/" + "a".repeat(50)
+  const name = defaultPeerName(longDir, "12345678")
+  assert.ok(name.length <= 32, `name too long: ${name.length}`)
+  assert.match(name, /^a{27}-5678$/)
+})
+
+test("defaultPeerName: validates within NAME_RE", () => {
+  // every auto-generated name must pass validateName
+  const name = defaultPeerName("/Users/me/my-cool_project", "abcdef12")
+  assert.equal(validateName(name), null)
+  const longName = defaultPeerName("/" + "b".repeat(60), "xyz99999")
+  assert.equal(validateName(longName), null)
 })
