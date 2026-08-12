@@ -1,5 +1,9 @@
 # opencode-plugin-peers
 
+[![npm version](https://img.shields.io/npm/v/opencode-plugin-peers.svg)](https://www.npmjs.com/package/opencode-plugin-peers)
+[![npm downloads](https://img.shields.io/npm/dm/opencode-plugin-peers.svg)](https://www.npmjs.com/package/opencode-plugin-peers)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/jkrandom-sudo/opencode-plugin-peers/blob/main/LICENSE)
+
 Cross-session messaging for [opencode](https://opencode.ai) — let independent opencode instances on the same machine discover each other and exchange plain-text messages. Modeled after [Claude Code's cross-session messaging](https://claudefa.st/blog/guide/mechanics/cross-session-messaging).
 
 Run several opencode terminals in parallel (different repos, worktrees, or tasks) and let them hand each other conclusions instead of copy-pasting context between windows:
