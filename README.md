@@ -1,5 +1,7 @@
 # opencode-plugin-peers
 
+**English** | [中文](./README.zh-CN.md)
+
 [![npm version](https://img.shields.io/npm/v/opencode-plugin-peers.svg)](https://www.npmjs.com/package/opencode-plugin-peers)
 [![npm downloads](https://img.shields.io/npm/dm/opencode-plugin-peers.svg)](https://www.npmjs.com/package/opencode-plugin-peers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/jkrandom-sudo/opencode-plugin-peers/blob/main/LICENSE)

@@ -30,6 +30,7 @@
     "dist",
     "commands",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE"
   ],
   "keywords": [
