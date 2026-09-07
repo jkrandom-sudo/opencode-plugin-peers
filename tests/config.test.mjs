@@ -1,18 +1,19 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { join } from "node:path"
 import { resolveConfig, defaultDataDir, validateName, defaultPeerName } from "../dist/config.js"
 
 test("defaultDataDir honors XDG_DATA_HOME and falls back to ~/.local/share", () => {
   assert.equal(defaultDataDir({ XDG_DATA_HOME: "/xdg" }), "/xdg")
-  assert.match(defaultDataDir({}), /\.local\/share$/)
+  assert.ok(defaultDataDir({}).endsWith(join(".local", "share")))
 })
 
 test("resolveConfig applies defaults", () => {
   const cfg = resolveConfig(undefined, { XDG_DATA_HOME: "/xdg" })
-  assert.equal(cfg.storageDir, "/xdg/opencode-plugin-peers")
-  assert.equal(cfg.peersDir, "/xdg/opencode-plugin-peers/peers.d")
-  assert.equal(cfg.inboxFile, "/xdg/opencode-plugin-peers/inbox.json")
-  assert.equal(cfg.spoolDir, "/xdg/opencode-plugin-peers/spool")
+  assert.equal(cfg.storageDir, join("/xdg", "opencode-plugin-peers"))
+  assert.equal(cfg.peersDir, join("/xdg", "opencode-plugin-peers", "peers.d"))
+  assert.equal(cfg.inboxFile, join("/xdg", "opencode-plugin-peers", "inbox.json"))
+  assert.equal(cfg.spoolDir, join("/xdg", "opencode-plugin-peers", "spool"))
   assert.equal(cfg.inboundPolicy, "accept")
   assert.equal(cfg.peerPermissions, "allow")
   assert.equal(cfg.heartbeatMs, 10_000)
@@ -41,7 +42,7 @@ test("resolveConfig merges user options", () => {
   assert.equal(cfg.peerPermissions, "ask")
   assert.equal(cfg.name, "frontend")
   assert.equal(cfg.maxQueue, 5)
-  assert.equal(cfg.peersDir, "/custom/peers.d")
+  assert.equal(cfg.peersDir, join("/custom", "peers.d"))
 })
 
 test("validateName accepts safe names and rejects dangerous ones", () => {

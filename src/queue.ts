@@ -167,6 +167,9 @@ function migrationStateFiles(spoolDir: string, state: SpoolState): string[] {
 }
 
 function syncMigrationDirectory(directory: string): void {
+  // Directory fsync is POSIX-only; on Windows it raises EPERM. The fsync'd
+  // file plus rename is the best durability available there.
+  if (process.platform === "win32") return
   const fd = openSync(directory, "r")
   try {
     fsyncSync(fd)
@@ -605,6 +608,7 @@ export function MessageQueue(opts: QueueOptions): QueueInstance {
   }
 
   function syncDirectory(directory: string): void {
+    if (process.platform === "win32") return
     const dirFd = openSync(directory, "r")
     try {
       fsyncSync(dirFd)

@@ -36,7 +36,8 @@ test("outbox durably separates transport receipt from final acknowledgement", as
       acknowledgedAt: 200,
     }), true)
     assert.equal(restarted.get("session-from", "m-1").finalStatus, "delivered")
-    assert.equal((await stat(join(dir, "outbox"))).mode & 0o777, 0o700)
+    // Windows cannot represent POSIX permission bits; stat always reports 0o666.
+    if (process.platform !== "win32") assert.equal((await stat(join(dir, "outbox"))).mode & 0o777, 0o700)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

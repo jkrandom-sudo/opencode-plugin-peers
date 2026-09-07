@@ -52,8 +52,12 @@ export function Outbox(opts: { storageDir: string }): OutboxInstance {
     }
     chmodSync(temp, 0o600)
     renameSync(temp, target)
-    const dirFd = openSync(directory, "r")
-    try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
+    // Directory fsync is POSIX-only (EPERM on Windows); file fsync above is
+    // the best durability available there.
+    if (process.platform !== "win32") {
+      const dirFd = openSync(directory, "r")
+      try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
+    }
   }
 
   function update(endpointId: string, messageId: string, values: Partial<OutboxRecord>): OutboxRecord | null {

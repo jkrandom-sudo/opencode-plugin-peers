@@ -7,6 +7,8 @@ import { MessageQueue, RateLimiter } from "../dist/queue.js"
 import { gateMessage, isLoopMessage } from "../dist/gating.js"
 
 const noopLogger = async () => {}
+// Windows cannot represent POSIX permission bits; stat always reports 0o666.
+const isPosix = process.platform !== "win32"
 
 const msg = (id) => ({
   id,
@@ -62,7 +64,7 @@ test("queue: stores queued messages in an endpoint spool", async () => {
     const [file] = await readdir(queuedDir)
     const entry = join(queuedDir, file)
     assert.deepEqual(JSON.parse(await readFile(entry, "utf8")).message.id, "durable")
-    assert.equal((await stat(entry)).mode & 0o777, 0o600)
+    if (isPosix) assert.equal((await stat(entry)).mode & 0o777, 0o600)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -148,7 +150,7 @@ test("queue: repairs permissions on an existing endpoint directory", async () =>
 
     const q = MessageQueue({ endpointId: "endpoint-a", maxQueue: 1, maxHeld: 1, inboxFile: join(dir, "inbox.json"), logger: noopLogger })
     assert.equal(q.enqueue(msg("secure-endpoint")), true)
-    assert.equal((await stat(endpointDir)).mode & 0o777, 0o700)
+    if (isPosix) assert.equal((await stat(endpointDir)).mode & 0o777, 0o700)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

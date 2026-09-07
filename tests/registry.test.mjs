@@ -6,6 +6,8 @@ import { join } from "node:path"
 import { Registry, newInstanceId, pidAlive, uniqueName } from "../dist/registry.js"
 
 const noopLogger = async () => {}
+// Windows cannot represent POSIX permission bits; stat always reports 0o666.
+const isPosix = process.platform !== "win32"
 
 async function makeDir() {
   return mkdtemp(join(tmpdir(), "peers-registry-"))
@@ -43,8 +45,10 @@ test("start writes a 0600 entry file with expected fields", async () => {
     assert.equal(entry.inboundPolicy, "accept")
     assert.equal(entry.inboxUrl, "http://127.0.0.1:5000")
     assert.ok(entry.heartbeatAt > 0)
-    const mode = (await stat(join(dir, files[0]))).mode & 0o777
-    assert.equal(mode, 0o600)
+    if (isPosix) {
+      const mode = (await stat(join(dir, files[0]))).mode & 0o777
+      assert.equal(mode, 0o600)
+    }
     await reg.stop()
     assert.deepEqual(await readdir(dir), [])
   } finally {
@@ -192,7 +196,7 @@ test("v2 registry publishes one endpoint per session plus the most-recent v1 com
       entry: JSON.parse(await readFile(join(dir, file), "utf8")),
       mode: (await stat(join(dir, file))).mode & 0o777,
     })))
-    assert.ok(entries.every(({ mode }) => mode === 0o600))
+    if (isPosix) assert.ok(entries.every(({ mode }) => mode === 0o600))
 
     const v2 = entries.filter(({ entry }) => entry.version === 2).map(({ entry }) => entry)
     assert.deepEqual(v2.map((entry) => entry.endpointId).sort(), ["session-alpha", "session-beta"])

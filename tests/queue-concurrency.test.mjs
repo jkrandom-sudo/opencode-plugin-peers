@@ -5,13 +5,14 @@ import { mkdtemp, readdir, rm, stat, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
+import { fileURLToPath } from "node:url"
 
-const worker = new URL("./fixtures/queue-worker.mjs", import.meta.url)
-const staleRaceWorker = new URL("./fixtures/stale-lock-race-worker.mjs", import.meta.url)
+const worker = fileURLToPath(new URL("./fixtures/queue-worker.mjs", import.meta.url))
+const staleRaceWorker = fileURLToPath(new URL("./fixtures/stale-lock-race-worker.mjs", import.meta.url))
 
 function runWorker(dir, name, id, text, maxQueue, operation = "enqueue") {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [worker.pathname, dir, name, id, text, String(maxQueue), operation], {
+    const child = spawn(process.execPath, [worker, dir, name, id, text, String(maxQueue), operation], {
       stdio: ["ignore", "pipe", "pipe"],
     })
     let stdout = ""
@@ -39,7 +40,7 @@ async function releaseWorkers(dir, count) {
 }
 
 function startStaleRaceWorker(dir, role, messageId, payloadBytes = 0) {
-  const child = spawn(process.execPath, [staleRaceWorker.pathname, dir, role, messageId, String(payloadBytes)], {
+  const child = spawn(process.execPath, [staleRaceWorker, dir, role, messageId, String(payloadBytes)], {
     stdio: ["ignore", "pipe", "pipe"],
   })
   let stdout = ""

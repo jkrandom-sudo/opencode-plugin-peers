@@ -10,6 +10,9 @@ import { Outbox } from "../dist/outbox.js"
 import { Sender } from "../dist/sender.js"
 
 const noopLogger = async () => {}
+// Exercise the UDS listener where the platform has one; Windows gets the
+// loopback TCP listener (UDS binds are unsupported there).
+const listenerPlatform = process.platform === "win32" ? "win32" : "darwin"
 
 test("held accept/drop/expiry outcomes round-trip as durable final ACKs", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peers-ack-e2e-"))
@@ -17,7 +20,7 @@ test("held accept/drop/expiry outcomes round-trip as durable final ACKs", async 
   const senderEndpoint = "session-sender"
   const receiverEndpoint = "session-receiver"
   const senderListener = InboxListener({
-    token: "sender-token", maxBodyBytes: 20_000, runtimeDir: join(dir, "runtime"), processId: "sender", platform: "darwin",
+    token: "sender-token", maxBodyBytes: 20_000, runtimeDir: join(dir, "runtime"), processId: "sender", platform: listenerPlatform,
     resolveEndpoint: ({ toEndpointId }) => toEndpointId === senderEndpoint ? senderEndpoint : null,
     onMessage: async () => "refused",
     onAcknowledgement: async (ack) => { await outbox.applyAcknowledgement(ack) },
@@ -25,7 +28,7 @@ test("held accept/drop/expiry outcomes round-trip as durable final ACKs", async 
   })
   const queue = MessageQueue({ endpointId: receiverEndpoint, maxQueue: 10, maxHeld: 10, heldExpiryMs: 1_000, inboxFile: join(dir, "receiver", "inbox.json"), logger: noopLogger })
   const receiverListener = InboxListener({
-    token: "receiver-token", maxBodyBytes: 20_000, runtimeDir: join(dir, "runtime"), processId: "receiver", platform: "darwin",
+    token: "receiver-token", maxBodyBytes: 20_000, runtimeDir: join(dir, "runtime"), processId: "receiver", platform: listenerPlatform,
     resolveEndpoint: ({ toEndpointId }) => toEndpointId === receiverEndpoint ? receiverEndpoint : null,
     onMessage: async (message) => await queue.hold(message) ? "held" : "duplicate",
     logger: noopLogger,

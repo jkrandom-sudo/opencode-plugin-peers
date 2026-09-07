@@ -10,6 +10,8 @@ import { Sender } from "../dist/sender.js"
 import { LocalTransport } from "../dist/transport.js"
 
 const noopLogger = async () => {}
+// Node has no Unix-domain socket support on Windows; the UDS tests are POSIX-only.
+const udsSkip = process.platform === "win32" ? "Unix-domain sockets are unavailable on Windows" : false
 
 const v2Message = (toEndpointId) => ({
   version: 2,
@@ -22,7 +24,7 @@ const v2Message = (toEndpointId) => ({
   sentAt: Date.now(),
 })
 
-test("local UDS transport authenticates and routes v2 exactly while v1 uses compatibility endpoint", async () => {
+test("local UDS transport authenticates and routes v2 exactly while v1 uses compatibility endpoint", { skip: udsSkip }, async () => {
   const runtimeDir = await mkdtemp(join(tmpdir(), "peers-transport-"))
   const routed = []
   const acknowledgements = []
@@ -110,7 +112,7 @@ test("local UDS transport authenticates and routes v2 exactly while v1 uses comp
   }
 })
 
-test("UDS startup rejects a live process-id collision without unlinking the owner", async () => {
+test("UDS startup rejects a live process-id collision without unlinking the owner", { skip: udsSkip }, async () => {
   const runtimeDir = await mkdtemp(join(tmpdir(), "peers-transport-collision-"))
   const received = []
   const first = InboxListener({
@@ -150,7 +152,7 @@ test("UDS startup rejects a live process-id collision without unlinking the owne
   }
 })
 
-test("UDS startup removes a stale socket left by a crashed owner", async () => {
+test("UDS startup removes a stale socket left by a crashed owner", { skip: udsSkip }, async () => {
   const runtimeDir = await mkdtemp(join(tmpdir(), "peers-transport-stale-"))
   const socketPath = join(runtimeDir, "stale-process.sock")
   const child = spawn(process.execPath, [
@@ -187,7 +189,7 @@ test("UDS startup removes a stale socket left by a crashed owner", async () => {
   }
 })
 
-test("UDS start failures close the server and leave no socket artifact", async () => {
+test("UDS start failures close the server and leave no socket artifact", { skip: udsSkip }, async () => {
   const runtimeDir = await mkdtemp(join(tmpdir(), "peers-transport-failure-"))
   const listener = InboxListener({
     token: "secret",

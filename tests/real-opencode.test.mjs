@@ -144,6 +144,7 @@ function v2Message(from, to, id, text) {
 }
 
 test("real OpenCode hosts provide busy exact injection, restart recovery, permission boundaries, v1 interop, and held command ACKs", { timeout: 60_000 }, async (t) => {
+  if (process.platform === "win32") return t.skip("transport liveness assertions are UDS-specific; POSIX-only for now")
   const found = spawnSync("which", ["opencode"], { encoding: "utf8" })
   if (found.status !== 0 || !found.stdout.trim()) return t.skip("opencode binary is unavailable")
   const binary = found.stdout.trim()
