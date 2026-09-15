@@ -119,7 +119,7 @@ test("stale cleanup preserves a fresh owner and waits for its release", {
     assert.equal(holder.child.exitCode, null)
 
     const staleTicket = join(ticketsDir, "ticket-0000000000000000-00000000000000000000000000000000.json")
-    await writeFile(staleTicket, JSON.stringify({ ticket: 0, token: "00000000000000000000000000000000", createdAt: 0 }))
+    await writeFile(staleTicket, JSON.stringify({ ticket: 0, token: "0".repeat(32), createdAt: 0 }))
     const old = new Date(Date.now() - 31_000)
     await utimes(staleTicket, old, old)
 

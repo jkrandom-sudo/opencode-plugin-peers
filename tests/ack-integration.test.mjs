@@ -17,7 +17,7 @@ test("held accept/drop/expiry outcomes round-trip as durable final ACKs", async 
   const senderEndpoint = "session-sender"
   const receiverEndpoint = "session-receiver"
   const senderListener = InboxListener({
-    token: "sender-token", maxBodyBytes: 20_000, runtimeDir: join(dir, "runtime"), processId: "sender", platform: "darwin",
+    token: "example-sender-token", maxBodyBytes: 20_000, runtimeDir: join(dir, "runtime"), processId: "sender", platform: "darwin",
     resolveEndpoint: ({ toEndpointId }) => toEndpointId === senderEndpoint ? senderEndpoint : null,
     onMessage: async () => "refused",
     onAcknowledgement: async (ack) => { await outbox.applyAcknowledgement(ack) },
@@ -25,7 +25,7 @@ test("held accept/drop/expiry outcomes round-trip as durable final ACKs", async 
   })
   const queue = MessageQueue({ endpointId: receiverEndpoint, maxQueue: 10, maxHeld: 10, heldExpiryMs: 1_000, inboxFile: join(dir, "receiver", "inbox.json"), logger: noopLogger })
   const receiverListener = InboxListener({
-    token: "receiver-token", maxBodyBytes: 20_000, runtimeDir: join(dir, "runtime"), processId: "receiver", platform: "darwin",
+    token: "example-receiver-token", maxBodyBytes: 20_000, runtimeDir: join(dir, "runtime"), processId: "receiver", platform: "darwin",
     resolveEndpoint: ({ toEndpointId }) => toEndpointId === receiverEndpoint ? receiverEndpoint : null,
     onMessage: async (message) => await queue.hold(message) ? "held" : "duplicate",
     logger: noopLogger,
@@ -40,13 +40,13 @@ test("held accept/drop/expiry outcomes round-trip as durable final ACKs", async 
     const receiverEntry = {
       version: 2, endpointId: receiverEndpoint, processId: "receiver", pid: process.pid, sessionId: "ses-r",
       title: "receiver", name: "beta", hostname: "localhost", directory: "/tmp/b", status: "idle",
-      transport: receiverAddress.address, serverUrl: "", inboxUrl: receiverAddress.url, inboxToken: "receiver-token",
+      transport: receiverAddress.address, serverUrl: "", inboxUrl: receiverAddress.url, inboxToken: "example-receiver-token",
       capabilities: ["ack"], timestamps: { startedAt: Date.now(), updatedAt: Date.now(), heartbeatAt: Date.now() },
       policy: { inboundPolicy: "hold", peerPermissions: "ask" }, pluginVersion: "0.2.0",
       activeSessionId: "ses-r", activeSessionTitle: "receiver", busy: false, queuedCount: 0,
       inboundPolicy: "hold", startedAt: Date.now(), heartbeatAt: Date.now(),
     }
-    const ackTarget = { transport: senderAddress.address, inboxToken: "sender-token" }
+    const ackTarget = { transport: senderAddress.address, inboxToken: "example-sender-token" }
     const dispatch = async () => {
       for (const ack of queue.pendingAcknowledgements()) {
         await LocalTransport().ack(ackTarget, ack)

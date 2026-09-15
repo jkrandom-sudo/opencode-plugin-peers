@@ -228,20 +228,20 @@ test("registry dual-reads a legacy v1 process beside v2 session endpoints", asyn
     await writeFile(join(dir, "legacy.json"), JSON.stringify({
       version: 1, instanceId: "legacy-process", name: "legacy", pid: process.pid,
       hostname: "h", directory: "/legacy", serverUrl: "http://127.0.0.1:1",
-      inboxUrl: "http://127.0.0.1:2", inboxToken: "legacy-token",
+      inboxUrl: "http://127.0.0.1:2", inboxToken: "example-legacy-token",
       activeSessionId: "ses_legacy", activeSessionTitle: "old", inboundPolicy: "accept",
       startedAt: now, heartbeatAt: now, pluginVersion: "0.1.7",
     }))
     await writeFile(join(dir, "remote-compat.json"), JSON.stringify({
       version: 1, instanceId: "remote-process", name: "remote", pid: process.pid,
       hostname: "h", directory: "/remote", serverUrl: "", inboxUrl: "http+unix://x",
-      inboxToken: "remote-token", activeSessionId: "ses_remote", activeSessionTitle: "new",
+      inboxToken: "example-remote-token", activeSessionId: "ses_remote", activeSessionTitle: "new",
       inboundPolicy: "accept", startedAt: now, heartbeatAt: now, pluginVersion: "0.1.7",
     }))
     await writeFile(join(dir, "remote-v2.json"), JSON.stringify({
       version: 2, endpointId: "session-remote", processId: "remote-process", pid: process.pid,
       sessionId: "ses_remote", title: "new", name: "remote", hostname: "h", directory: "/remote",
-      status: "idle", transport: { type: "unix", path: "/tmp/remote.sock" }, inboxToken: "remote-token",
+      status: "idle", transport: { type: "unix", path: "/tmp/remote.sock" }, inboxToken: "example-remote-token",
       capabilities: ["local", "protocol-v2", "prompt-async", "ack"],
       timestamps: { startedAt: now, updatedAt: now, heartbeatAt: now },
       policy: { inboundPolicy: "accept", peerPermissions: "allow" }, pluginVersion: "0.1.7",
