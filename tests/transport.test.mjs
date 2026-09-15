@@ -114,7 +114,7 @@ test("UDS startup rejects a live process-id collision without unlinking the owne
   const runtimeDir = await mkdtemp(join(tmpdir(), "peers-transport-collision-"))
   const received = []
   const first = InboxListener({
-    token: "first-token",
+    token: "example-first-token",
     maxBodyBytes: 20_000,
     runtimeDir,
     processId: "same-process",
@@ -124,7 +124,7 @@ test("UDS startup rejects a live process-id collision without unlinking the owne
     logger: noopLogger,
   })
   const second = InboxListener({
-    token: "second-token",
+    token: "example-second-token",
     maxBodyBytes: 20_000,
     runtimeDir,
     processId: "same-process",
@@ -137,7 +137,7 @@ test("UDS startup rejects a live process-id collision without unlinking the owne
     const started = await first.start()
     await assert.rejects(second.start(), /already in use|collision/i)
     const response = await LocalTransport().send(
-      { transport: started.address, inboxToken: "first-token" },
+      { transport: started.address, inboxToken: "example-first-token" },
       v2Message("session-exact")
     )
     assert.equal(response.http, 202)
