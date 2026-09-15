@@ -76,7 +76,7 @@
     "@opencode-ai/plugin": "^1.18.0",
     "@opentui/core": "^0.4.5",
     "@opentui/keymap": "^0.4.5",
-    "@opentui/solid": "^0.4.5",
+    "@opentui/solid": "^0.5.11",
     "@types/node": "^22.0.0",
     "typescript": "^5.4.0"
   },
