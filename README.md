@@ -1,5 +1,9 @@
 # opencode-plugin-peers
 
+**Moritz fork:** read [session-safe addressing](#moritz-fork-session-safe-addressing)
+below. This fork uses session titles and IDs, and refuses legacy process routing.
+The upstream installation examples below still refer to the upstream npm package.
+
 **English** | [中文](./README.zh-CN.md)
 
 [![npm version](https://img.shields.io/npm/v/opencode-plugin-peers.svg)](https://www.npmjs.com/package/opencode-plugin-peers)
@@ -25,7 +29,7 @@ Run several opencode terminals in parallel (different repos, worktrees, or tasks
 - **Peer-triggered turns run unattended by default**: permission requests raised while acting on an injected peer message are auto-approved (`peerPermissions`, modeled after Claude Code's permission modes). Your own turns are unaffected
 - Command results and notifications are shown **inline in the session** — no toast popups
 - **Explicit TUI controls**: palette actions use host dialogs for selection and confirmation; slash wrappers remain available for automation and compatibility
-- Local only: everything stays on your machine (Unix-domain sockets on macOS/Linux, loopback TCP on Windows, plus a compatibility loopback listener for v1 peers)
+- Local only: Unix-domain sockets on macOS/Linux and loopback TCP on Windows. Session-safe routing requires protocol v2.
 
 ## Install
 
@@ -145,7 +149,7 @@ OpenCode process A                         OpenCode process B
 └──────────────────────────────┘           └──────────────────────────────┘
 ```
 
-- **Discovery**: protocol v2 publishes one `0600` registry record per session endpoint and one v1 compatibility record for the most recently active root session. Only sessions with signs of life in the publishing process are advertised — busy/retry at startup, any session event or message activity thereafter, or undelivered spool records awaiting recovery. Historical sessions from `session.list()` are never published, so `/peers` shows live sessions only (a closed process disappears within one stale window; a deleted session disappears on the next heartbeat). Readers accept both versions. The default peer name is `<dir>-<hex4>` (e.g. `my-app-a3f2`), making same-directory instances distinguishable; an explicit `name` option or `/peers-name` replaces it entirely.
+- **Discovery**: protocol v2 publishes one `0600` registry record per session. Startup adopts busy sessions and undelivered spool records. New sessions and message activity register endpoints; metadata updates alone do not. Names use the OpenCode title plus the full session ID. Readers accept v1 records for diagnostics, but sends require v2. Dead processes and expired registrations disappear on the next cleanup heartbeat.
 - **Transport**: v2 uses an authenticated Unix-domain socket on macOS/Linux or loopback TCP on Windows. A loopback HTTP listener remains available to protocol-v1 senders. Peers never call another process's OpenCode server.
 - **Delivery and recovery**: each message is a `0600` JSON record under `spool/<endpoint>/{queued,held,inflight,done}`. Atomic transitions, process locks, deterministic OpenCode message IDs and durable deduplication make retries and restarts safe. Legacy `inbox.json` is archived without delivery because it has no trustworthy session target.
 - **ACK semantics**: HTTP acceptance is only a receipt. Final `delivered`, `refused`, `expired`, `dropped` or `duplicate` ACKs are durably retried to the sender and stored in `outbox/<sender-endpoint>`.
@@ -222,3 +226,41 @@ Zero runtime dependencies beyond `@opencode-ai/plugin` (peer) and `zod` (tool sc
 ## License
 
 MIT
+# Moritz fork: session-safe addressing
+
+This fork uses OpenCode's session title, the same title agentview reads, followed
+by the **full session ID**: `Upgrade SciSpace to Premium [ses_...]`. The ID is
+immutable and avoids suffix collisions. A rename changes the displayed title, not
+the destination session. All same-process sessions are listed, not an arbitrary
+single session for each Location/plugin instance.
+
+`send_message.to` accepts that exact qualified name, the full `ses_...` ID, or
+the `session-...` endpoint ID shown in `list_agents`. Bare titles and legacy
+directory/process aliases fail with candidate addresses, never a guessed target.
+Old qualified names fail after a title change. Protocol-v1 sends and receives are
+refused because v1 carries no destination session and can silently switch targets.
+Upgrade both ends to protocol v2.
+
+Dead PIDs and expired heartbeats are cleaned on the next registry heartbeat,
+including expired registrations whose PID is still alive. Metadata updates alone
+do not resurrect historical sessions. Archived, moved, or deleted sessions are
+withdrawn; a periodic metadata check also catches missed lifecycle events. Idle
+sessions remain addressable while their server is alive. Closing a TUI alone is
+not a session deletion, and the plugin cannot infer whether an agentview row is
+hidden. Pending spools remain on disk for recovery.
+
+The old process-wide `name` setting is no longer a session address. `/peers-name`
+renames the invoking session title when the adapter supports `session.update`;
+otherwise it fails explicitly and asks for an OpenCode/agentview title rename.
+The V2 parity adapter currently lacks this rename method; normal title updates
+still propagate to peers.
+
+The Cursor provider exposes plugin tools through `GetDynamicTools` and
+`CallDynamicTool`, not Cursor-native top-level functions. Use namespace
+`opencode`, e.g. `{ "namespace": "opencode", "toolName": "list_agents",
+"arguments": {} }`. Native OpenAI exposes them directly. This is provider
+routing, not late plugin registration; restarting does not change that distinction.
+
+After replacing an installed plugin, already-loaded Locations may keep the old
+module. Restart the shared server only once its owner approves. New sessions on
+an already-loaded Location do not prove that the replacement code is active.

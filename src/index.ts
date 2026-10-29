@@ -37,7 +37,7 @@ import { handlePeersCommand } from "./commands.js"
 import { consumeCommand, createLogger, errorMessage } from "./feedback.js"
 import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 
-const PLUGIN_VERSION = "0.2.2"
+const PLUGIN_VERSION = "0.2.5-moritz.1"
 const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox", "peers-outbox"])
 
 /**
@@ -60,7 +60,7 @@ const INJECTED_COMMANDS: Record<string, { description: string; template: string 
       "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, call the list_agents tool and show the result to the user verbatim.",
   },
   "peers-name": {
-    description: "Show or set this instance's peer name (used by other sessions to address you)",
+    description: "Show this session's address, or rename its OpenCode title (also shown in agentview)",
     template:
       "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, tell the user the plugin is not loaded and no action was taken.",
   },
@@ -121,10 +121,11 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
     maxMessageAgeMs: config.maxMessageAgeMs,
     processId: instanceId,
     resolveEndpoint: async ({ version, toEndpointId }) => {
+      // V1 carries no target session. Even a once-unique process name can
+      // point at another session between discovery and delivery. Fail closed.
+      if (version === 1) return null
       const resolve = () =>
-        version === 1
-          ? runtime.compatibilityEndpointId()
-          : toEndpointId && runtime.hasEndpoint(toEndpointId)
+        toEndpointId && runtime.hasEndpoint(toEndpointId)
             ? toEndpointId
             : null
       const immediate = resolve()
@@ -308,9 +309,18 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
             registry,
             queue,
             delivery,
-            getName: () => currentName,
+            getName: () => runtime.registryEndpoints().find((entry) => entry.sessionId === input.sessionID)?.name ?? currentName,
             setName: async (name) => {
-              currentName = name
+              // /peers-name renames this session, not every session sharing
+              // this Location. Agentview reads this same OpenCode title.
+              if (!ctx.client.session.update) throw new Error("This adapter does not support session rename. Rename the session in OpenCode or agentview; peers follows its title.")
+              const result = await ctx.client.session.update({
+                path: { id: input.sessionID },
+                query: { directory: ctx.directory },
+                body: { title: name },
+              })
+              if (!result.data) throw new Error("session rename failed")
+              await runtime.handleEvent({ type: "session.updated", properties: { info: result.data } })
               await registry.heartbeat()
               return { name, changed: false }
             },

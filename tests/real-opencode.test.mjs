@@ -16,6 +16,12 @@ const here = dirname(fileURLToPath(import.meta.url))
 const pluginUrl = pathToFileURL(join(here, "..", "dist", "index.js")).href
 const hostPluginUrl = pathToFileURL(join(here, "fixtures", "real-opencode-host-plugin.mjs")).href
 
+async function readJsonResponse(response) {
+  const text = await response.text()
+  assert.ok(text, `Empty HTTP ${response.status} response from ${response.url}`)
+  return JSON.parse(text)
+}
+
 async function freePort() {
   const server = createServer()
   server.listen(0, "127.0.0.1")
@@ -56,6 +62,7 @@ async function startOpenCode(binary, root, label, directory, dataDir, runtimeDir
       OPENCODE_DISABLE_DEFAULT_PLUGINS: "1",
       OPENCODE_DISABLE_PROJECT_CONFIG: "1",
       OPENCODE_DISABLE_CLAUDE_CODE: "1",
+      OPENCODE_SERVER_PASSWORD: "",
       ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -85,7 +92,7 @@ async function callFixture(control, action, body) {
     headers: { "content-type": "application/json", "x-peers-fixture-token": control.token },
     body: JSON.stringify(body),
   })
-  const result = await response.json()
+  const result = await readJsonResponse(response)
   assert.equal(response.ok, true, JSON.stringify(result))
   return result
 }
@@ -108,7 +115,7 @@ async function createSession(proc, title) {
   const url = new URL(`http://127.0.0.1:${proc.port}/session`)
   url.searchParams.set("directory", proc.directory)
   const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title }) })
-  const body = await response.json()
+  const body = await readJsonResponse(response)
   assert.equal(response.ok, true, JSON.stringify(body))
   return body
 }
@@ -118,7 +125,7 @@ async function sessionMessages(proc, session) {
   url.searchParams.set("directory", session.directory)
   const response = await fetch(url)
   assert.equal(response.ok, true)
-  return response.json()
+  return readJsonResponse(response)
 }
 
 async function registryEntries(peersDir) {
@@ -143,10 +150,12 @@ function v2Message(from, to, id, text) {
   }
 }
 
-test("real OpenCode hosts provide busy exact injection, restart recovery, permission boundaries, v1 interop, and held command ACKs", { timeout: 60_000 }, async (t) => {
+test("real V1 hosts provide exact injection, restart recovery, permission boundaries, legacy refusal, and held ACKs", { timeout: 90_000 }, async (t) => {
   const found = spawnSync("which", ["opencode"], { encoding: "utf8" })
-  if (found.status !== 0 || !found.stdout.trim()) return t.skip("opencode binary is unavailable")
-  const binary = found.stdout.trim()
+  const binary = process.env.OPENCODE_TEST_V1_BINARY || found.stdout?.trim()
+  if (!binary) return t.skip("V1 binary unavailable; set OPENCODE_TEST_V1_BINARY")
+  const version = spawnSync(binary, ["--version"], { encoding: "utf8" })
+  if (!/^1\./.test(version.stdout.trim())) return t.skip("This harness uses V1 HTTP/plugin APIs; set OPENCODE_TEST_V1_BINARY to test V1 compatibility")
   // Keep POSIX UDS paths below the platform socket-path limit (macOS is ~104 bytes).
   const root = await mkdtemp(join(process.platform === "win32" ? tmpdir() : "/tmp", "peers-real-opencode-"))
   const dataDir = join(root, "data")
@@ -177,7 +186,9 @@ test("real OpenCode hosts provide busy exact injection, restart recovery, permis
     const alphaEndpoint = newest(entries, (entry) => entry.version === 2 && entry.sessionId === alphaSession.id && alive(entry) && existsSync(entry.transport.path ?? ""))
     const betaOneEndpoint = newest(entries, (entry) => entry.version === 2 && entry.sessionId === betaOne.id && alive(entry) && existsSync(entry.transport.path ?? ""))
     const betaTwoEndpoint = newest(entries, (entry) => entry.version === 2 && entry.sessionId === betaTwo.id && alive(entry) && existsSync(entry.transport.path ?? ""))
-    assert.equal(betaOneEndpoint.name, betaTwoEndpoint.name)
+    assert.notEqual(betaOneEndpoint.name, betaTwoEndpoint.name)
+    assert.equal(betaOneEndpoint.name, `same-name [${betaOne.id}]`)
+    assert.equal(betaTwoEndpoint.name, `same-name [${betaTwo.id}]`)
 
     const transport = LocalTransport()
     assert.equal((await transport.send(betaTwoEndpoint, v2Message(alphaEndpoint, betaTwoEndpoint, "real-exact", "REAL_EXACT_TARGET"))).status, "delivered")
@@ -225,14 +236,23 @@ test("real OpenCode hosts provide busy exact injection, restart recovery, permis
 
     const v1 = entries.find((entry) => entry.version === 1 && entry.instanceId === betaTwoEndpoint.processId)
     const v1Result = await Sender({ self: { instanceId: "legacy-real", name: "legacy", directory: root } }).send(v1, "REAL_V1_INTEROP")
-    assert.equal(v1Result.ok, true)
+    assert.equal(v1Result.ok, false)
 
     const oldEndpointId = betaTwoEndpoint.endpointId
     await stopOpenCode(beta)
-    beta = await startOpenCode(binary, root, "beta-restart", join(root, "beta"), dataDir, runtimeDir, pluginUrl, betaPort)
+    beta = await startOpenCode(binary, root, "beta-restart", join(root, "beta"), dataDir, runtimeDir, hostPluginUrl, betaPort, {
+      PEERS_FIXTURE_CONTROL_FILE: betaControlFile,
+      PEERS_FIXTURE_INBOUND_POLICY: "accept",
+    })
     const listUrl = new URL(`http://127.0.0.1:${beta.port}/session`)
     listUrl.searchParams.set("directory", beta.directory)
-    await (await fetch(listUrl)).json()
+    await readJsonResponse(await fetch(listUrl))
+    // A completed historical session is intentionally not advertised after a
+    // restart. Resuming its activity re-registers the same immutable endpoint.
+    const restartedControl = await fixtureControl(betaControlFile)
+    await callFixture(restartedControl, "event", {
+      event: { type: "session.status", properties: { sessionID: betaTwo.id, status: { type: "busy" } } },
+    })
     try {
       entries = await waitFor(async () => {
         const all = await registryEntries(peersDir)
@@ -301,6 +321,8 @@ test("real OpenCode hosts provide busy exact injection, restart recovery, permis
     await outbox.recordPending(expiredHeld, guardedEndpoint.name)
     assert.equal((await transport.send(guardedEndpoint, expiredHeld)).status, "held")
     assert.equal(await waitFor(async () => outbox.get(alphaEndpoint.endpointId, expiredHeld.messageId)?.finalStatus), "expired")
+  } catch (error) {
+    throw new Error(`${error.stack ?? error}\nalpha: ${alpha?.logs()}\nbeta: ${beta?.logs()}\nguarded: ${guarded?.logs()}`)
   } finally {
     await Promise.all([stopOpenCode(guarded), stopOpenCode(beta), stopOpenCode(alpha)])
     await rm(root, { recursive: true, force: true })

@@ -12,6 +12,7 @@
  */
 
 import type { ListedPeer } from "./registry.js"
+import { peerName } from "./identity.js"
 
 /** "just now" | "9m ago" | "2h ago" | "3d ago" */
 export function relativeAge(since: number, now: number): string {
@@ -71,7 +72,7 @@ export function sortPeers<T extends ListedPeer>(peers: T[]): T[] {
 }
 
 export function formatSessionList(peers: ListedPeer[], now: number): string {
-  const online = sortPeers(collapseToProcesses(peers.filter((p) => p.alive)))
+  const online = sortPeers(peers.filter((p) => p.alive))
   const offline = peers.filter((p) => !p.alive)
   const lines: string[] = []
 
@@ -80,12 +81,10 @@ export function formatSessionList(peers: ListedPeer[], now: number): string {
   } else {
     lines.push(`Other Opencode sessions (${online.length}):`)
     for (const p of online) {
-      const rawTitle = p.entry.activeSessionTitle?.trim()
-      const titleSeg = rawTitle
-        ? `"${rawTitle.length > 40 ? rawTitle.slice(0, 39) + "…" : rawTitle}"`
-        : null
+      const rawTitle = p.entry.version === 1 ? p.entry.activeSessionTitle?.trim() : null
+      const titleSeg = rawTitle ? `"${rawTitle.length > 40 ? rawTitle.slice(0, 39) + "…" : rawTitle}"` : null
       const segments = [
-        p.entry.name,
+        peerName(p.entry),
         ...(titleSeg ? [titleSeg] : []),
         p.entry.directory,
         `started ${relativeAge(p.entry.startedAt, now)}`,
