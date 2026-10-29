@@ -1,13 +1,15 @@
 import { createServer } from "node:http"
 import { randomBytes } from "node:crypto"
 import { writeFile } from "node:fs/promises"
-import { PeersPlugin } from "../../dist/index.js"
+import { PeersPlugin } from "../../../dist/index.js"
 
 // Use the user's actual V2 parity adapter, but only this fork's peers plugin.
 const { activate } = await import(process.env.OPENCODE_TEST_V2_PARITY)
 export default {
   id: "peers-isolated-v2-test",
-  setup: (ctx) => activate(ctx, [async (input) => {
+  setup: async (ctx) => {
+    let control
+    const cleanup = await activate(ctx, [async (input) => {
     // Store a real V2 synthetic message without starting a model or spending
     // credentials. Routing and event projection use the real V2 service.
     input.client.session.promptAsync = async ({ path, body }) => {
@@ -30,9 +32,14 @@ export default {
       } catch (error) { response.writeHead(500).end(String(error)) }
     })
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve))
-    await writeFile(process.env.PEERS_V2_CONTROL, JSON.stringify({ port: server.address().port, token }))
+    control = { port: server.address().port, token }
     const dispose = hooks.dispose
     hooks.dispose = async () => { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); await dispose() }
     return hooks
-  }]),
+  }])
+    // Native registry reads can finish before asynchronous plugin setup. Do
+    // not admit test sessions until the adapter's event subscription is ready.
+    await writeFile(process.env.PEERS_V2_CONTROL, JSON.stringify(control))
+    return cleanup
+  },
 }

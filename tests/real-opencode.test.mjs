@@ -68,12 +68,13 @@ async function startOpenCode(binary, root, label, directory, dataDir, runtimeDir
       OPENCODE_SERVER_PASSWORD: "",
       ...extraEnv,
     },
+    detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
   })
   let logs = ""
   child.stdout.on("data", (chunk) => { logs += chunk })
   child.stderr.on("data", (chunk) => { logs += chunk })
-  await waitFor(async () => {
+  try { await waitFor(async () => {
     if (child.exitCode !== null) throw new Error(`opencode ${label} exited ${child.exitCode}: ${logs}`)
     try {
       await fetch(`http://127.0.0.1:${port}/global/health`, { signal: AbortSignal.timeout(500) })
@@ -81,7 +82,10 @@ async function startOpenCode(binary, root, label, directory, dataDir, runtimeDir
     } catch {
       return false
     }
-  })
+  }) } catch (error) {
+    await stopOpenCode({ child })
+    throw error
+  }
   return { child, port, directory, logs: () => logs }
 }
 
@@ -106,10 +110,12 @@ function messageIdContaining(messages, text) {
 
 async function stopOpenCode(proc) {
   if (!proc || proc.child.exitCode !== null || proc.child.signalCode !== null) return
-  proc.child.kill("SIGTERM")
+  if (process.platform === "win32") proc.child.kill("SIGTERM")
+  else process.kill(-proc.child.pid, "SIGTERM")
   await Promise.race([once(proc.child, "exit"), new Promise((resolve) => setTimeout(resolve, 3_000))])
   if (proc.child.exitCode === null && proc.child.signalCode === null) {
-    proc.child.kill("SIGKILL")
+    if (process.platform === "win32") proc.child.kill("SIGKILL")
+    else process.kill(-proc.child.pid, "SIGKILL")
     await once(proc.child, "exit")
   }
 }
@@ -179,6 +185,7 @@ test("real V1 hosts provide exact injection, restart recovery, permission bounda
       PEERS_FIXTURE_INBOUND_POLICY: "accept",
     })
     const alphaSession = await createSession(alpha, "same-name")
+    assert.ok(existsSync(join(dataDir, "test-history.db")), "V1 must create its database inside the test data directory")
     const betaOne = await createSession(beta, "same-name")
     const betaTwo = await createSession(beta, "same-name")
     const betaControl = await fixtureControl(betaControlFile)

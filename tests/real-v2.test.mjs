@@ -2,8 +2,9 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
+import { existsSync } from "node:fs"
 import { once } from "node:events"
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises"
 import { createServer } from "node:net"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -22,12 +23,13 @@ test("real isolated V2 parity adapter lists every title, routes exact sessions, 
   const binary = process.env.OPENCODE_TEST_V2_BINARY
   if (!binary || !process.env.OPENCODE_TEST_V2_PARITY) return t.skip("Set OPENCODE_TEST_V2_BINARY and OPENCODE_TEST_V2_PARITY to verify an installed V2 adapter")
   // Short root is necessary for the macOS Unix socket path limit.
-  const root = await mkdtemp("/tmp/peers-v2-")
+  const root = await realpath(await mkdtemp("/tmp/peers-v2-"))
   const directory = join(root, "project")
   const config = join(root, "opencode")
   const controlFile = join(root, "control.json")
   await Promise.all([mkdir(directory), mkdir(config)])
-  await writeFile(join(config, "opencode.json"), JSON.stringify({ plugins: [fileURLToPath(new URL("./fixtures/v2-host.mjs", import.meta.url))] }))
+  const pluginConfig = JSON.stringify({ plugins: [fileURLToPath(new URL("./fixtures/v2-host", import.meta.url))] })
+  await writeFile(join(config, "opencode.json"), pluginConfig)
   const portServer = createServer()
   portServer.listen(0, "127.0.0.1")
   await once(portServer, "listening")
@@ -37,11 +39,11 @@ test("real isolated V2 parity adapter lists every title, routes exact sessions, 
   const password = randomBytes(24).toString("hex")
   const child = spawn(binary, ["serve", "--hostname", "127.0.0.1", "--port", String(port), "--log-level", "warn"], {
     cwd: directory, detached: true, stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, OPENCODE_CONFIG_DIR: config, OPENCODE_CONFIG_CONTENT: "{}",
+    env: { ...process.env, OPENCODE_CONFIG_DIR: config, OPENCODE_CONFIG_CONTENT: pluginConfig,
       OPENCODE_DB: join(root, "history.db"), XDG_DATA_HOME: join(root, "data"),
       XDG_CONFIG_HOME: root, XDG_STATE_HOME: join(root, "state"), XDG_CACHE_HOME: join(root, "cache"),
       XDG_RUNTIME_DIR: join(root, "run"), OPENCODE_SERVER_PASSWORD: password, PEERS_V2_CONTROL: controlFile,
-      OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_CLAUDE_CODE: "1" },
+      OPENCODE_DISABLE_DEFAULT_PLUGINS: "0", OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_CLAUDE_CODE: "1" },
   })
   child.stdout.on("data", (chunk) => { logs += chunk })
   child.stderr.on("data", (chunk) => { logs += chunk })
@@ -60,14 +62,17 @@ test("real isolated V2 parity adapter lists every title, routes exact sessions, 
       return api("GET", "/api/info")
     })
     await api("GET", "/api/location")
+    const effectiveConfig = await api("GET", "/api/config")
+    assert.match(JSON.stringify(effectiveConfig), /v2-host/, "isolated config did not load the fixture plugin")
     await api("GET", "/api/command")
     const plugins = await api("GET", "/api/plugin")
-    const one = await api("POST", "/api/session", { title: "Initial one", location: { directory } })
-    const two = await api("POST", "/api/session", { title: "Initial two", location: { directory } })
     const control = await waitFor(async () => {
       try { return JSON.parse(await readFile(controlFile, "utf8")) }
       catch { throw new Error(`V2 test plugin did not start. Plugin inventory: ${JSON.stringify(plugins)}`) }
     })
+    const { data: one } = await api("POST", "/api/session", { title: "Initial one", location: { directory } })
+    assert.ok(existsSync(join(root, "history.db")), "V2 must create its database inside the test root")
+    const { data: two } = await api("POST", "/api/session", { title: "Initial two", location: { directory } })
     const call = async (tool, args) => {
       const result = await fetch(`http://127.0.0.1:${control.port}`, { method: "POST",
         headers: { authorization: `Bearer ${control.token}` }, body: JSON.stringify({ tool, args, sessionID: one.id }) })
@@ -77,12 +82,20 @@ test("real isolated V2 parity adapter lists every title, routes exact sessions, 
     // Patch also exercises the adapter's real session.renamed projection.
     await api("PATCH", `/api/session/${one.id}`, { title: "Same title" })
     await api("PATCH", `/api/session/${two.id}`, { title: "Same title" })
-    await waitFor(async () => (await call("list_agents", {})).includes(`Same title [${two.id}]`))
+    await waitFor(async () => {
+      const listing = await call("list_agents", {})
+      if (listing.includes(`Same title [${two.id}]`)) return listing
+      throw new Error(`Waiting for native V2 title projection: ${listing}`)
+    })
     assert.match(await call("send_message", { to: "Same title", message: "[peers test] ambiguous" }), /unqualified or ambiguous/)
     assert.match(await call("send_message", { to: `Same title [${two.id}]`, message: "[peers test] exact receiver" }), /delivered/)
-    const messages = await api("GET", `/api/session/${two.id}/message`)
-    assert.match(JSON.stringify(messages), /exact receiver/)
-    assert.doesNotMatch(JSON.stringify(await api("GET", `/api/session/${one.id}/message`)), /exact receiver/)
+    // resume:false deliberately persists input in the native inbox without
+    // starting a model. It need not be materialized in message history yet.
+    const records = async (id) => JSON.stringify(await Promise.all([
+      api("GET", `/api/session/${id}/message`), api("GET", `/api/session/${id}/inbox`),
+    ]))
+    await waitFor(async () => (await records(two.id)).includes("exact receiver"))
+    assert.doesNotMatch(await records(one.id), /exact receiver/)
     await api("PATCH", `/api/session/${two.id}`, { title: "Renamed title" })
     await waitFor(async () => (await call("list_agents", {})).includes(`Renamed title [${two.id}]`))
     assert.match(await call("send_message", { to: `Same title [${two.id}]`, message: "[peers test] stale" }), /no peer named/)
