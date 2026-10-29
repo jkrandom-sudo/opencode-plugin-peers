@@ -56,6 +56,9 @@ async function startOpenCode(binary, root, label, directory, dataDir, runtimeDir
       ...process.env,
       XDG_CONFIG_HOME: xdgConfig,
       XDG_DATA_HOME: dataDir,
+      // The agent harness exports OPENCODE_DB for the live server. It wins
+      // over XDG_DATA_HOME, so every test child MUST replace it explicitly.
+      OPENCODE_DB: join(dataDir, "test-history.db"),
       XDG_RUNTIME_DIR: runtimeDir,
       OPENCODE_CONFIG_DIR: configDir,
       OPENCODE_CONFIG_CONTENT: JSON.stringify({ plugin: [plugin] }),
