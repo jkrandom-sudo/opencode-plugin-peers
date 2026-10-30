@@ -1,9 +1,5 @@
 # opencode-plugin-peers
 
-**Moritz fork:** read [session-safe addressing](#moritz-fork-session-safe-addressing)
-below. This fork uses session titles and IDs, and refuses legacy process routing.
-The upstream installation examples below still refer to the upstream npm package.
-
 **English** | [中文](./README.zh-CN.md)
 
 [![npm version](https://img.shields.io/npm/v/opencode-plugin-peers.svg)](https://www.npmjs.com/package/opencode-plugin-peers)
@@ -226,41 +222,13 @@ Zero runtime dependencies beyond `@opencode-ai/plugin` (peer) and `zod` (tool sc
 ## License
 
 MIT
-# Moritz fork: session-safe addressing
+# Session-safe addressing
 
-This fork uses OpenCode's session title, the same title agentview reads, followed
-by the **full session ID**: `Upgrade SciSpace to Premium [ses_...]`. The ID is
-immutable and avoids suffix collisions. A rename changes the displayed title, not
-the destination session. All same-process sessions are listed, not an arbitrary
-single session for each Location/plugin instance.
+Names are the OpenCode session title plus the full session ID, for example
+`Upgrade SciSpace to Premium [ses_...]`. The ID does not change when the title
+does. Every live session in the process is listed.
 
-`send_message.to` accepts that exact qualified name, the full `ses_...` ID, or
-the `session-...` endpoint ID shown in `list_agents`. Bare titles and legacy
-directory/process aliases fail with candidate addresses, never a guessed target.
-Old qualified names fail after a title change. Protocol-v1 sends and receives are
-refused because v1 carries no destination session and can silently switch targets.
-Upgrade both ends to protocol v2.
-
-Dead PIDs and expired heartbeats are cleaned on the next registry heartbeat,
-including expired registrations whose PID is still alive. Metadata updates alone
-do not resurrect historical sessions. Archived, moved, or deleted sessions are
-withdrawn; a periodic metadata check also catches missed lifecycle events. Idle
-sessions remain addressable while their server is alive. Closing a TUI alone is
-not a session deletion, and the plugin cannot infer whether an agentview row is
-hidden. Pending spools remain on disk for recovery.
-
-The old process-wide `name` setting is no longer a session address. `/peers-name`
-renames the invoking session title when the adapter supports `session.update`;
-otherwise it fails explicitly and asks for an OpenCode/agentview title rename.
-The V2 parity adapter currently lacks this rename method; normal title updates
-still propagate to peers.
-
-The Cursor provider exposes plugin tools through `GetDynamicTools` and
-`CallDynamicTool`, not Cursor-native top-level functions. Use namespace
-`opencode`, e.g. `{ "namespace": "opencode", "toolName": "list_agents",
-"arguments": {} }`. Native OpenAI exposes them directly. This is provider
-routing, not late plugin registration; restarting does not change that distinction.
-
-After replacing an installed plugin, already-loaded Locations may keep the old
-module. Restart the shared server only once its owner approves. New sessions on
-an already-loaded Location do not prove that the replacement code is active.
+`send_message.to` accepts that exact name, the full `ses_...` ID, or the
+`session-...` endpoint ID from `list_agents`. A bare title or an old process
+alias fails and lists the real addresses. It never guesses. Protocol v1 has no
+destination session, so those sends are refused.

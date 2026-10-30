@@ -37,7 +37,7 @@ import { handlePeersCommand } from "./commands.js"
 import { consumeCommand, createLogger, errorMessage } from "./feedback.js"
 import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 
-const PLUGIN_VERSION = "0.2.5-moritz.1"
+const PLUGIN_VERSION = "0.2.4"
 const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox", "peers-outbox"])
 
 /**
@@ -60,7 +60,7 @@ const INJECTED_COMMANDS: Record<string, { description: string; template: string 
       "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, call the list_agents tool and show the result to the user verbatim.",
   },
   "peers-name": {
-    description: "Show this session's address, or rename its OpenCode title (also shown in agentview)",
+    description: "Show this session's address, or rename its OpenCode title",
     template:
       "$ARGUMENTS\n\nIf this command was not intercepted by the opencode-plugin-peers plugin, tell the user the plugin is not loaded and no action was taken.",
   },
@@ -312,8 +312,8 @@ export const PeersPlugin: Plugin = async (ctx, pluginOptions) => {
             getName: () => runtime.registryEndpoints().find((entry) => entry.sessionId === input.sessionID)?.name ?? currentName,
             setName: async (name) => {
               // /peers-name renames this session, not every session sharing
-              // this Location. Agentview reads this same OpenCode title.
-              if (!ctx.client.session.update) throw new Error("This adapter does not support session rename. Rename the session in OpenCode or agentview; peers follows its title.")
+              // this Location. Peers uses the same OpenCode title.
+              if (!ctx.client.session.update) throw new Error("This adapter does not support session rename. Rename the session in OpenCode; peers follows its title.")
               const result = await ctx.client.session.update({
                 path: { id: input.sessionID },
                 query: { directory: ctx.directory },

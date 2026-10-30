@@ -1,6 +1,6 @@
 {
   "name": "opencode-plugin-peers",
-  "version": "0.2.5-moritz.1",
+  "version": "0.2.4",
   "description": "Cross-session messaging for opencode — let independent sessions discover and text each other, modeled after Claude Code's cross-session messaging",
   "type": "module",
   "main": "./dist/index.js",
@@ -48,12 +48,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/moritzWa/opencode-plugin-peers.git"
+    "url": "git+https://github.com/jkrandom-sudo/opencode-plugin-peers.git"
   },
   "bugs": {
-    "url": "https://github.com/moritzWa/opencode-plugin-peers/issues"
+    "url": "https://github.com/jkrandom-sudo/opencode-plugin-peers/issues"
   },
-  "homepage": "https://github.com/moritzWa/opencode-plugin-peers#readme",
+  "homepage": "https://github.com/jkrandom-sudo/opencode-plugin-peers#readme",
   "engines": {
     "node": ">=18",
     "opencode": ">=1.18.0"
