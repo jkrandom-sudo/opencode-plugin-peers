@@ -257,7 +257,8 @@ test("formatMessages escapes nothing but structures blocks", () => {
   const out = formatMessages([msg("1")])
   assert.ok(out.startsWith('[peer message from "beta"'))
   assert.match(out, /sender endpoint: aaaa1111/)
-  assert.ok(out.endsWith('the sender\'s exact endpoint ID "aaaa1111".'))
+  assert.match(out, /NOT delivered to them/)
+  assert.ok(out.endsWith('call send_message with `to` set to the sender\'s exact endpoint ID "aaaa1111".'))
 })
 
 test("a hung promptAsync is abandoned after injectTimeoutMs and the message requeues", async () => {
