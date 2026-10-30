@@ -10,6 +10,7 @@ import {
   type QueueInstance,
 } from "./queue.js"
 import type { RegistryEndpoint } from "./registry.js"
+import { sessionName } from "./identity.js"
 import { SessionTracker, type SessionTrackerInstance } from "./session-tracker.js"
 import type { InboundMessage, InboundPolicy, Logger, PeerAcknowledgementV2, ReceiveStatus, SessionEndpointStatus } from "./types.js"
 
@@ -20,7 +21,7 @@ interface OpenCodeSession {
   directory: string
   parentID?: string
   title: string
-  time: { created: number; updated: number }
+  time: { created: number; updated: number; archived?: number }
 }
 
 interface RuntimeEndpoint {
@@ -75,6 +76,7 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
   let stopPromise: Promise<void> | null = null
   let readyPromise: Promise<void> | null = null
   let markReady: () => void = () => {}
+  let nextRefreshAt = 0
 
   function whileRunning<T>(fallback: T, operation: () => Promise<T>): Promise<T> {
     if (lifecycle !== "running") return Promise.resolve(fallback)
@@ -91,6 +93,10 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
       b.session.time.created - a.session.time.created ||
       b.session.id.localeCompare(a.session.id)
     )[0] ?? null
+  }
+
+  function eligible(session: OpenCodeSession): boolean {
+    return !session.time?.archived && (!session.directory || session.directory === opts.directory)
   }
 
   async function upsert(session: OpenCodeSession, status?: SessionEndpointStatus): Promise<RuntimeEndpoint> {
@@ -148,6 +154,7 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
           query: { directory: parent.directory || opts.directory },
         })
         for (const child of responseData<OpenCodeSession[]>(response) ?? []) {
+          if (!eligible(child)) continue
           const childStatus = Object.prototype.hasOwnProperty.call(statuses, child.id)
             ? normalizeStatus(statuses[child.id])
             : undefined
@@ -172,7 +179,7 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
         query: { directory: opts.directory },
       })
       const session = responseData<OpenCodeSession>(response)
-      return session ? upsert(session) : null
+      return session && eligible(session) ? upsert(session) : null
     } catch {
       return null
     }
@@ -230,9 +237,10 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
               session = undefined
             }
           }
-          if (session) await upsert(session, status)
+          if (session && eligible(session)) await upsert(session, status)
         }
         for (const session of sessions) {
+          if (!eligible(session)) continue
           if (endpoints.has(session.id)) continue
           if (hasSpoolRecords(opts.config, session.id)) {
             const endpoint = await upsert(session, normalizeStatus(statuses[session.id]))
@@ -275,7 +283,7 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
         sessionId: endpoint.session.id,
         ...(endpoint.session.parentID ? { parentSessionId: endpoint.session.parentID } : {}),
         title: endpoint.session.title,
-        name: opts.name(),
+        name: sessionName(endpoint.session.title, endpoint.session.id),
         directory: endpoint.session.directory || opts.directory,
         status: endpoint.status,
         startedAt: endpoint.session.time.created,
@@ -319,9 +327,21 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
     handleEvent(event) {
       return whileRunning(false, async () => {
         const properties = event.properties ?? {}
-        const info = properties.info as OpenCodeSession | undefined
+        let info = properties.info as OpenCodeSession | undefined
         if (event.type === "session.created" || event.type === "session.updated") {
           if (!info?.id) return false
+          // The V2 parity adapter's created event can omit the title. Read
+          // the canonical session rather than publishing a blank/generated name.
+          if (event.type === "session.created" && !info.title) {
+            try {
+              const response = await opts.client.session.get({ path: { id: info.id }, query: { directory: opts.directory } })
+              info = responseData<OpenCodeSession>(response) ?? info
+            } catch { /* creation metadata will be reconciled by the sweep */ }
+          }
+          if (!eligible(info)) return endpoints.delete(info.id)
+          // Metadata/title updates to historical sessions are not evidence of
+          // a live session. Only update an existing endpoint or a new session.
+          if (event.type === "session.updated" && !endpoints.has(info.id)) return false
           await upsert(info)
           if (event.type === "session.created") await loadChildren(info)
           return true
@@ -345,9 +365,11 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
         if (event.type === "session.status" || event.type === "session.idle") {
           const sessionId = properties.sessionID as string | undefined
           if (!sessionId) return false
+          const status = event.type === "session.idle" ? "idle" : normalizeStatus(properties.status)
+          if (status === "idle" && !endpoints.has(sessionId)) return false
           const endpoint = await findSession(sessionId)
           if (!endpoint) return false
-          setStatus(endpoint, event.type === "session.idle" ? "idle" : normalizeStatus(properties.status))
+          setStatus(endpoint, status)
           return true
         }
         return false
@@ -371,6 +393,25 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
 
     sweep() {
       return whileRunning(undefined, async () => {
+        // Events can be missed during reloads. Reconcile existing endpoints,
+        // never adopt the entire historical session list on a heartbeat.
+        if (Date.now() >= nextRefreshAt) {
+          nextRefreshAt = Date.now() + 60_000
+          for (const endpoint of [...endpoints.values()]) {
+            try {
+              const response = await opts.client.session.get({
+                path: { id: endpoint.session.id },
+                query: { directory: opts.directory },
+              })
+              const session = responseData<OpenCodeSession>(response)
+              if (session && eligible(session)) await upsert(session)
+              else if (session || !response.error || response.response?.status === 404) endpoints.delete(endpoint.session.id)
+            } catch (error) {
+              if ((error as { status?: number })?.status === 404) endpoints.delete(endpoint.session.id)
+              // A transient API failure is not proof that a session died.
+            }
+          }
+        }
         for (const endpoint of endpoints.values()) {
           await endpoint.queue.expireHeld()
           await endpoint.delivery.flush()

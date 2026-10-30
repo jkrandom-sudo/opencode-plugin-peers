@@ -25,7 +25,7 @@ Run several opencode terminals in parallel (different repos, worktrees, or tasks
 - **Peer-triggered turns run unattended by default**: permission requests raised while acting on an injected peer message are auto-approved (`peerPermissions`, modeled after Claude Code's permission modes). Your own turns are unaffected
 - Command results and notifications are shown **inline in the session** — no toast popups
 - **Explicit TUI controls**: palette actions use host dialogs for selection and confirmation; slash wrappers remain available for automation and compatibility
-- Local only: everything stays on your machine (Unix-domain sockets on macOS/Linux, loopback TCP on Windows, plus a compatibility loopback listener for v1 peers)
+- Local only: Unix-domain sockets on macOS/Linux and loopback TCP on Windows. Session-safe routing requires protocol v2.
 
 ## Install
 
@@ -145,7 +145,7 @@ OpenCode process A                         OpenCode process B
 └──────────────────────────────┘           └──────────────────────────────┘
 ```
 
-- **Discovery**: protocol v2 publishes one `0600` registry record per session endpoint and one v1 compatibility record for the most recently active root session. Only sessions with signs of life in the publishing process are advertised — busy/retry at startup, any session event or message activity thereafter, or undelivered spool records awaiting recovery. Historical sessions from `session.list()` are never published, so `/peers` shows live sessions only (a closed process disappears within one stale window; a deleted session disappears on the next heartbeat). Readers accept both versions. The default peer name is `<dir>-<hex4>` (e.g. `my-app-a3f2`), making same-directory instances distinguishable; an explicit `name` option or `/peers-name` replaces it entirely.
+- **Discovery**: protocol v2 publishes one `0600` registry record per session. Startup adopts busy sessions and undelivered spool records. New sessions and message activity register endpoints; metadata updates alone do not. Names use the OpenCode title plus the full session ID. Readers accept v1 records for diagnostics, but sends require v2. Dead processes and expired registrations disappear on the next cleanup heartbeat.
 - **Transport**: v2 uses an authenticated Unix-domain socket on macOS/Linux or loopback TCP on Windows. A loopback HTTP listener remains available to protocol-v1 senders. Peers never call another process's OpenCode server.
 - **Delivery and recovery**: each message is a `0600` JSON record under `spool/<endpoint>/{queued,held,inflight,done}`. Atomic transitions, process locks, deterministic OpenCode message IDs and durable deduplication make retries and restarts safe. Legacy `inbox.json` is archived without delivery because it has no trustworthy session target.
 - **ACK semantics**: HTTP acceptance is only a receipt. Final `delivered`, `refused`, `expired`, `dropped` or `duplicate` ACKs are durably retried to the sender and stored in `outbox/<sender-endpoint>`.
@@ -222,3 +222,13 @@ Zero runtime dependencies beyond `@opencode-ai/plugin` (peer) and `zod` (tool sc
 ## License
 
 MIT
+# Session-safe addressing
+
+Names are the OpenCode session title plus the full session ID, for example
+`Upgrade SciSpace to Premium [ses_...]`. The ID does not change when the title
+does. Every live session in the process is listed.
+
+`send_message.to` accepts that exact name, the full `ses_...` ID, or the
+`session-...` endpoint ID from `list_agents`. A bare title or an old process
+alias fails and lists the real addresses. It never guesses. Protocol v1 has no
+destination session, so those sends are refused.
