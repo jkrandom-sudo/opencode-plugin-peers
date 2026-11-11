@@ -104,7 +104,7 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
 
     send_message: tool({
       description:
-        "Send a plain-text message immediately to an exact opencode session on this machine, including while it is busy. Text only — no files or conversation history. Resolve the target with list_agents first if unsure.",
+        "Send a plain-text message immediately to an exact opencode session on this machine, including while it is busy. Text only — no files or conversation history. Resolve the target with list_agents first if unsure. The recipient cannot see your chat, and you cannot see theirs: their answer only reaches you if they send it back with this tool, so make the message self-contained, say what you need, and say how to answer. This is also how you answer a peer message you received: plain text in your own chat is not delivered to them.",
       args: {
         to: z.string().describe("Peer name or instanceId (see list_agents)"),
         message: z.string().describe("Plain-text message body"),
