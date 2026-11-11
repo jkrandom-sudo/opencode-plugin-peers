@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto"
 import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, writeSync } from "node:fs"
 import { dirname, join } from "node:path"
+import { syncDirectory } from "./fs.js"
 import type { OutboxRecord, PeerAcknowledgementV2, PeerMessageV2, ReceiveStatus } from "./types.js"
 
 export interface OutboxInstance {
@@ -52,8 +53,7 @@ export function Outbox(opts: { storageDir: string }): OutboxInstance {
     }
     chmodSync(temp, 0o600)
     renameSync(temp, target)
-    const dirFd = openSync(directory, "r")
-    try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
+    syncDirectory(directory)
   }
 
   function update(endpointId: string, messageId: string, values: Partial<OutboxRecord>): OutboxRecord | null {

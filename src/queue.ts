@@ -18,6 +18,7 @@ import {
 } from "node:fs"
 import { createHash, randomBytes } from "node:crypto"
 import { dirname, join, resolve } from "node:path"
+import { syncDirectory } from "./fs.js"
 import type { ResolvedConfig } from "./config.js"
 import type { HeldMessage, InboundMessage, Logger, PeerAcknowledgementV2, ReceiveStatus } from "./types.js"
 
@@ -166,15 +167,6 @@ function migrationStateFiles(spoolDir: string, state: SpoolState): string[] {
   }
 }
 
-function syncMigrationDirectory(directory: string): void {
-  const fd = openSync(directory, "r")
-  try {
-    fsyncSync(fd)
-  } finally {
-    closeSync(fd)
-  }
-}
-
 function ensureMigrationDirectory(directory: string): void {
   mkdirSync(directory, { recursive: true, mode: 0o700 })
   chmodSync(directory, 0o700)
@@ -193,7 +185,7 @@ function persistMigrationRecord(target: string, record: unknown): void {
   }
   chmodSync(temporary, 0o600)
   renameSync(temporary, target)
-  syncMigrationDirectory(directory)
+  syncDirectory(directory)
 }
 
 function readSequence(path: string): number | null {
@@ -269,14 +261,14 @@ export async function migrateWorkspaceSpool(opts: {
           if (targetLocations.length === 0) {
             const target = join(targetDir, state, file)
             renameSync(source, target)
-            syncMigrationDirectory(join(sourceDir, state))
-            syncMigrationDirectory(join(targetDir, state))
+            syncDirectory(join(sourceDir, state))
+            syncDirectory(join(targetDir, state))
             result.migrated++
             continue
           }
           if (targetLocations.length === 1 && targetLocations[0] === join(targetDir, state, file) && sameFileContents(source, targetLocations[0])) {
             unlinkSync(source)
-            syncMigrationDirectory(join(sourceDir, state))
+            syncDirectory(join(sourceDir, state))
             result.deduplicated++
             continue
           }
@@ -292,9 +284,9 @@ export async function migrateWorkspaceSpool(opts: {
             unlinkSync(source)
           } else {
             renameSync(source, quarantine)
-            syncMigrationDirectory(base)
+            syncDirectory(base)
           }
-          syncMigrationDirectory(join(sourceDir, state))
+          syncDirectory(join(sourceDir, state))
           result.quarantined++
           collisions.push({ state, file, quarantine })
         }
@@ -308,7 +300,7 @@ export async function migrateWorkspaceSpool(opts: {
         const mergedSequence = Math.max(sourceSequence, targetSequence ?? 0)
         if (targetSequence !== mergedSequence) persistMigrationRecord(targetSequencePath, { value: mergedSequence })
         unlinkSync(sourceSequencePath)
-        syncMigrationDirectory(sourceDir)
+        syncDirectory(sourceDir)
       }
 
       persistMigrationRecord(join(targetDir, ".migrations", `${sourceEndpointId}.json`), {
@@ -602,15 +594,6 @@ export function MessageQueue(opts: QueueOptions): QueueInstance {
     mkdirSync(directory, { recursive: true, mode: 0o700 })
     chmodSync(spoolDir, 0o700)
     chmodSync(directory, 0o700)
-  }
-
-  function syncDirectory(directory: string): void {
-    const dirFd = openSync(directory, "r")
-    try {
-      fsyncSync(dirFd)
-    } finally {
-      closeSync(dirFd)
-    }
   }
 
   function persistRecord(target: string, record: unknown): void {
