@@ -76,11 +76,13 @@ test("session runtime adopts only live sessions at startup, then discovers by ev
     let endpoints = runtime.registryEndpoints()
     assert.deepEqual(endpoints.map((entry) => entry.sessionId), ["ses_two"])
 
-    // Event-driven adoption: an update adopts a historical session...
+    // Metadata updates must not adopt historical sessions.
     await runtime.handleEvent({
       type: "session.updated",
       properties: { info: session("ses_one") },
     })
+    assert.deepEqual(runtime.registryEndpoints().map((entry) => entry.sessionId), ["ses_two"])
+    await runtime.noteActivity("ses_one")
     // ...and creating a session also discovers its children.
     await runtime.handleEvent({
       type: "session.created",
@@ -89,7 +91,7 @@ test("session runtime adopts only live sessions at startup, then discovers by ev
     endpoints = runtime.registryEndpoints()
     assert.equal(endpoints.length, 3)
     assert.equal(new Set(endpoints.map((entry) => entry.endpointId)).size, 3)
-    assert.ok(endpoints.every((entry) => entry.name === "project"))
+    assert.ok(endpoints.every((entry) => entry.name === `same name [${entry.sessionId}]`))
     assert.ok(endpoints.some((entry) => entry.sessionId === "ses_child" && entry.parentSessionId === "ses_one"))
 
     const targetId = stableSessionEndpointId("ses_two")
@@ -167,21 +169,20 @@ test("plugin exposes same-process sessions and uses tool context sessionID as se
     const legacyResult = await Sender({
       self: { instanceId: "legacy-process", name: "legacy", directory: "/workspace/legacy" },
     }).send(compatibility, "old-to-new through published registry")
-    assert.deepEqual(legacyResult, { ok: true, status: "delivered" })
-    assert.equal(client.prompts.at(-1).path.id, "ses_one")
+    assert.equal(legacyResult.ok, false)
+    assert.equal(client.prompts.length, 0)
 
     const senderId = stableSessionEndpointId("ses_one")
     const targetId = stableSessionEndpointId("ses_two")
     const context = { sessionID: "ses_one" }
     const listing = await hooks.tool.list_agents.execute({}, context)
-    // list_agents collapses to one row per process; ses_one/ses_two/ses_child
-    // are all the same process, so only one endpoint id appears (not senderId
-    // since that is the self endpoint filtered out).
+    // Every other session remains visible, including same-process siblings.
     assert.doesNotMatch(listing, new RegExp(`- .*${senderId}`))
-    // send_message targeting by exact endpoint id still resolves to the
-    // full (un-collapsed) registry — tested below.
+    assert.match(listing, /2 peer\(s\) online/)
+    assert.match(listing, /same name \[ses_two\]/)
+    assert.match(listing, /same name \[ses_child\]/)
 
-    const ambiguous = await hooks.tool.send_message.execute({ to: "same-process", message: "hello" }, context)
+    const ambiguous = await hooks.tool.send_message.execute({ to: "same name", message: "hello" }, context)
     assert.match(ambiguous, /ambiguous/)
     const delivered = await hooks.tool.send_message.execute({ to: targetId, message: "exact hello" }, context)
     assert.match(delivered, /delivered/)

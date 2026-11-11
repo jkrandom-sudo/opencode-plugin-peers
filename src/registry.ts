@@ -78,6 +78,7 @@ export function newInboxToken(): string {
 }
 
 export function pidAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false
   if (pid === process.pid) return true
   try {
     process.kill(pid, 0)
@@ -232,6 +233,7 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
   }
 
   function staleReason(entry: PeerRegistryEntry, now: number): string | null {
+    if (!Number.isFinite(entry.heartbeatAt)) return "invalid heartbeat"
     const ageMs = now - entry.heartbeatAt
     if (ageMs > opts.staleMs) return `last heartbeat ${Math.round(ageMs / 1000)}s ago`
     if (!pidAlive(entry.pid)) return `pid ${entry.pid} is not running`
@@ -340,9 +342,12 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
         if (path === selfFile || selfV2Files.has(path)) continue
         try {
           const st = await stat(path)
-          if (now - st.mtimeMs < 5 * 60_000) continue
           const entry = await readEntry(file)
-          if (entry && pidAlive(entry.pid)) continue
+          if (entry ? !staleReason(entry, now) : now - st.mtimeMs < opts.staleMs) continue
+          // A heartbeat atomically replaces the inode. Do not unlink a renewed
+          // registration observed while cleanup was reading the old snapshot.
+          const latest = await stat(path)
+          if (latest.ino !== st.ino || latest.mtimeMs !== st.mtimeMs) continue
           await rm(path, { force: true })
           removed++
         } catch {

@@ -103,9 +103,12 @@ test("list excludes self and flags stale entries", async () => {
 test("pidAlive: own pid true, impossible pid false", () => {
   assert.equal(pidAlive(process.pid), true)
   assert.equal(pidAlive(2 ** 22 + 12345), false)
+  assert.equal(pidAlive(0), false)
+  assert.equal(pidAlive(-1), false)
+  assert.equal(pidAlive(NaN), false)
 })
 
-test("cleanupStale removes old dead-pid files only", async () => {
+test("cleanupStale removes dead-pid files immediately, including fresh ones", async () => {
   const dir = await makeDir()
   try {
     const reg = makeRegistry(dir, dyn)
@@ -131,9 +134,9 @@ test("cleanupStale removes old dead-pid files only", async () => {
     }))
 
     const removed = await reg.cleanupStale()
-    assert.equal(removed, 1)
+    assert.equal(removed, 2)
     const files = (await readdir(dir)).sort()
-    assert.ok(files.includes("freshdead.json"))
+    assert.ok(!files.includes("freshdead.json"))
     assert.ok(!files.includes("deadold.json"))
     await reg.stop()
   } finally {

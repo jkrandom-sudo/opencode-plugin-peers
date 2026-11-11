@@ -26,6 +26,11 @@ function makeRegistry(listed) {
   return { list: async () => listed }
 }
 
+function safePeerEntry(over = {}) {
+  return { ...peerEntry(), version: 2, endpointId: "session-beta", processId: "process-beta",
+    sessionId: "ses_beta", title: "beta", transport: { type: "tcp", host: "127.0.0.1", port: 1 }, ...over }
+}
+
 function makeSender(result) {
   const calls = []
   return {
@@ -97,14 +102,15 @@ test("send_message rejects empty and oversized messages", async () => {
   assert.equal(sender.calls.length, 0)
 })
 
-test("send_message resolves by name and by instanceId", async () => {
-  const listed = [{ entry: peerEntry(), alive: true, staleReason: null }]
+test("send_message resolves by qualified name, session ID and endpoint ID", async () => {
+  const listed = [{ entry: safePeerEntry(), alive: true, staleReason: null }]
   const { tools, sender } = makeTools({ listed })
-  const r1 = await tools.send_message.execute({ to: "beta", message: "hi" }, {})
-  assert.match(r1, /delivered to "beta"/)
-  const r2 = await tools.send_message.execute({ to: "bbbb2222", message: "hi" }, {})
+  const r1 = await tools.send_message.execute({ to: "beta [ses_beta]", message: "hi" }, {})
+  assert.match(r1, /delivered to "beta \[ses_beta\]"/)
+  const r2 = await tools.send_message.execute({ to: "ses_beta", message: "hi" }, {})
   assert.match(r2, /delivered/)
-  assert.equal(sender.calls.length, 2)
+  assert.match(await tools.send_message.execute({ to: "session-beta", message: "hi" }, {}), /delivered/)
+  assert.equal(sender.calls.length, 3)
 })
 
 test("send_message gives canonical v2 endpointId precedence without a v1 instanceId alias", async () => {
@@ -196,31 +202,31 @@ test("exact self, offline, and unknown endpoint IDs never fall back to colliding
 })
 
 test("send_message maps all receiver statuses", async () => {
-  const listed = [{ entry: peerEntry(), alive: true, staleReason: null }]
+  const listed = [{ entry: safePeerEntry(), alive: true, staleReason: null }]
   const cases = [
-    ["queued", /queued for "beta".*busy/],
+    ["queued", /queued for "beta \[ses_beta\]".*busy/],
     ["held", /awaits their approval/],
-    ["delivered", /delivered to "beta"/],
+    ["delivered", /delivered to "beta \[ses_beta\]"/],
     ["duplicate", /already received/],
   ]
   for (const [status, re] of cases) {
     const { tools } = makeTools({ listed, sendResult: { ok: true, status } })
-    assert.match(await tools.send_message.execute({ to: "beta", message: "hi" }, {}), re)
+    assert.match(await tools.send_message.execute({ to: "ses_beta", message: "hi" }, {}), re)
   }
 
   const { tools: refusedTools } = makeTools({
     listed,
     sendResult: { ok: false, error: '"beta" refuses inbound messages.' },
   })
-  assert.match(await refusedTools.send_message.execute({ to: "beta", message: "hi" }, {}), /refuses/)
+  assert.match(await refusedTools.send_message.execute({ to: "ses_beta", message: "hi" }, {}), /refuses/)
 })
 
 test("send_message enforces outbound rate limit", async () => {
-  const listed = [{ entry: peerEntry(), alive: true, staleReason: null }]
+  const listed = [{ entry: safePeerEntry(), alive: true, staleReason: null }]
   const { tools, sender } = makeTools({ listed, over: { sendLimit: RateLimiter(2) } })
-  await tools.send_message.execute({ to: "beta", message: "1" }, {})
-  await tools.send_message.execute({ to: "beta", message: "2" }, {})
-  const third = await tools.send_message.execute({ to: "beta", message: "3" }, {})
+  await tools.send_message.execute({ to: "ses_beta", message: "1" }, {})
+  await tools.send_message.execute({ to: "ses_beta", message: "2" }, {})
+  const third = await tools.send_message.execute({ to: "ses_beta", message: "3" }, {})
   assert.match(third, /rate limit/)
   assert.equal(sender.calls.length, 2)
 })

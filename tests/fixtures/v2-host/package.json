@@ -1,0 +1,9 @@
+{
+  "name": "peers-isolated-v2-test",
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./server.mjs",
+    "./server": "./server.mjs"
+  }
+}

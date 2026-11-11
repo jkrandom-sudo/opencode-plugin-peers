@@ -10,7 +10,8 @@ import type { ListedPeer, RegistryInstance } from "../registry.js"
 import type { Sender } from "../sender.js"
 import type { RateLimiter } from "../queue.js"
 import type { OutboxInstance } from "../outbox.js"
-import { collapseToProcesses, sortPeers } from "../format.js"
+import { sortPeers } from "../format.js"
+import { peerName } from "../identity.js"
 
 export interface ToolsDeps {
   registry: RegistryInstance
@@ -28,12 +29,12 @@ function entryId(entry: ListedPeer["entry"]): string {
 }
 
 function isEndpointShaped(target: string): boolean {
-  return /^(?:session|workspace)-[A-Za-z0-9][A-Za-z0-9_-]*$/.test(target)
+  return /^(?:(?:session|workspace)-|ses_)[A-Za-z0-9][A-Za-z0-9_-]*$/.test(target)
 }
 
 export function formatPeerList(peers: ListedPeer[], selfName: string, selfId: string): string {
-  const online = sortPeers(collapseToProcesses(peers.filter((p) => p.alive)))
-  const offline = sortPeers(collapseToProcesses(peers.filter((p) => !p.alive)))
+  const online = sortPeers(peers.filter((p) => p.alive))
+  const offline = sortPeers(peers.filter((p) => !p.alive))
   const lines: string[] = []
   if (online.length === 0) {
     lines.push("No peers online.")
@@ -46,7 +47,7 @@ export function formatPeerList(peers: ListedPeer[], selfName: string, selfId: st
         ? `session ${e.activeSessionTitle ? `"${e.activeSessionTitle}" ` : ""}(${e.activeSessionId})`
         : "(no active session)"
       lines.push(
-        `- "${e.name}" (id ${id}) — ${e.directory} — ${session} — inbound: ${e.inboundPolicy}`
+        `- "${peerName(e)}" (id ${id}) — ${e.directory} — ${session} — inbound: ${e.inboundPolicy}${e.version === 1 ? " — legacy process, unsafe for session targeting; upgrade required" : ""}`
       )
     }
   }
@@ -106,7 +107,7 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
       description:
         "Send a plain-text message immediately to an exact opencode session on this machine, including while it is busy. Text only — no files or conversation history. Resolve the target with list_agents first if unsure.",
       args: {
-        to: z.string().describe("Peer name or instanceId (see list_agents)"),
+        to: z.string().describe("Exact title [ses_ID] name, full session ID or endpoint ID from list_agents. Bare titles and process aliases are not safe addresses."),
         message: z.string().describe("Plain-text message body"),
       },
       async execute(args, context) {
@@ -123,7 +124,10 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
         const selfId = self?.endpointId ?? deps.selfInstanceId
         const listed = await deps.registry.list()
         const target = args.to.trim()
-        const knownExact = listed.find((peer) => entryId(peer.entry) === target)
+        const exact = listed.filter((peer) => entryId(peer.entry) === target ||
+          (peer.entry.version === 2 && peer.entry.sessionId === target))
+        if (exact.length > 1) return `Error: conflicting registrations for "${target}". Refresh list_agents; no message sent.`
+        const knownExact = exact[0]
         if (knownExact) {
           if (entryId(knownExact.entry) === selfId) {
             return `Error: cannot send a peer message to your own endpoint "${target}" in the same session.`
@@ -136,13 +140,18 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
         }
 
         const peers = listed.filter((p) => p.alive && entryId(p.entry) !== selfId)
-        const matches = knownExact ? [knownExact] : peers.filter((p) => p.entry.name === target)
+        // Never resolve a bare title or a process alias to whichever session is
+        // currently active. A qualified name binds the title to an immutable ID.
+        const matches = knownExact ? [knownExact] : peers.filter((p) => peerName(p.entry) === target)
         if (matches.length === 0) {
-          const stale = listed.find((p) => !p.alive && p.entry.name === target)
+          const stale = listed.find((p) => !p.alive && peerName(p.entry) === target)
           if (stale) {
             return `Error: peer "${target}" appears offline (${stale.staleReason}).`
           }
-          const names = peers.map((p) => `"${p.entry.name}"`).join(", ") || "(none)"
+          const candidates = peers.filter((p) => p.entry.version === 2 &&
+            (p.entry.title === target || p.entry.name === target))
+          if (candidates.length) return `Error: "${target}" is an unqualified or ambiguous name. Candidates: ${candidates.map((p) => `"${peerName(p.entry)}" (id ${entryId(p.entry)})`).join(", ")}. Use an exact qualified name or session ID.`
+          const names = peers.map((p) => `"${peerName(p.entry)}"`).join(", ") || "(none)"
           return `Error: no peer named "${target}". Online peers: ${names}`
         }
         if (matches.length > 1) {
@@ -152,7 +161,8 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
           return `Error: "${target}" is ambiguous. Candidates: ${candidates}. Use an instanceId.`
         }
 
-        const peer = matches[0].entry
+        const peer = { ...matches[0].entry, name: peerName(matches[0].entry) }
+        if (peer.version === 1) return `Error: "${peer.name}" only supports legacy process routing, which can switch sessions. Upgrade that peer before sending; no message sent.`
         if (!deps.sendLimit(entryId(peer))) {
           return `Error: outbound rate limit reached for "${peer.name}"; try again in a minute.`
         }
